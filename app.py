@@ -38,14 +38,13 @@ CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 DATA_FILE = os.path.join(DATA_DIR, "transactions.csv")
 
-# --- NEW: Added 'payables' column ---
 REQUIRED_COLUMNS = [
     "month", "year", "group_of_product", "product", "sub_product",
     "line_of_business", "branch", "channel", "agent",
     "gross_written_premium", "net_written_premium", "earned_premium",
     "claims_reported", "claims_paid", "outstanding_claims",
     "commissions", "brokerage_costs", "direct_costs", "indirect_costs",
-    "reinsurance_costs", "receivables", "payables",      # <-- added payables
+    "reinsurance_costs", "receivables", "payables",
     "budget", "actual", "forecast",
 ]
 
@@ -69,7 +68,6 @@ KPI_DEFINITIONS = {
     "Premium Growth": "Period-over-period percentage change in gross written premium.",
     "Budget Variance": "Difference between actual and budgeted production, expressed in "
                         "absolute value and as a percentage of budget.",
-    # New KPI definitions for receivables/payables
     "Avg Receivables Days": "Average number of days outstanding for receivables, calculated as (Receivables / Annualized GWP) * 365.",
     "Net Payables Days": "Average number of days to settle payables, calculated as (Payables / Annualized Claims+Expenses) * 365.",
 }
@@ -323,7 +321,7 @@ def generate_sample_data(hierarchy: pd.DataFrame, n_months: int = 24, seed: int 
                     "group_of_product": hrow["group_of_product"],
                     "product": hrow["product"],
                     "sub_product": hrow["sub_product"],
-                    "line_of_business": hrow["group_of_product"],  # LOB == product group, covers all LOBs
+                    "line_of_business": hrow["group_of_product"],
                     "branch": rng.choice(branches),
                     "channel": rng.choice(channels),
                     "agent": rng.choice(agents),
@@ -339,7 +337,7 @@ def generate_sample_data(hierarchy: pd.DataFrame, n_months: int = 24, seed: int 
                     "indirect_costs": round(indirect_costs, 0),
                     "reinsurance_costs": round(reinsurance, 0),
                     "receivables": round(receivables, 0),
-                    "payables": round(payables, 0),      # <-- new field
+                    "payables": round(payables, 0),
                     "budget": round(budget, 0),
                     "actual": round(actual, 0),
                     "forecast": round(forecast, 0),
@@ -358,7 +356,7 @@ def make_template(template_type: str) -> pd.DataFrame:
         "Claims": common + ["claims_reported", "claims_paid", "outstanding_claims"],
         "Production": common + ["gross_written_premium", "net_written_premium", "earned_premium"],
         "Expenses": common + ["commissions", "brokerage_costs", "direct_costs", "indirect_costs", "reinsurance_costs"],
-        "Receivables": common + ["receivables", "payables"],  # new template
+        "Receivables": common + ["receivables", "payables"],
     }
     cols = templates.get(template_type, REQUIRED_COLUMNS)
     return pd.DataFrame(columns=cols)
@@ -404,7 +402,6 @@ def merge_uploaded_data(existing: pd.DataFrame, new: pd.DataFrame) -> pd.DataFra
     for c in REQUIRED_COLUMNS:
         if c not in new.columns:
             new[c] = np.nan
-    # Ensure payables exists
     if "payables" not in new.columns:
         new["payables"] = 0.0
     merged = pd.concat([existing, new[REQUIRED_COLUMNS]], ignore_index=True)
@@ -442,13 +439,19 @@ def calculate_kpis(df: pd.DataFrame) -> pd.DataFrame:
     out["variance_abs"] = out["actual"] - out["budget"]
     out["variance_pct"] = safe_div(out["actual"] - out["budget"], out["budget"]) * 100
 
-    # New: days calculations (using annualized figures)
-    # Use gross written premium as a proxy for revenue, claims+expenses as proxy for purchases
+    # Days calculations
     out["avg_receivables_days"] = safe_div(out["receivables"], out["gross_written_premium"]) * 365
     out["net_payables_days"] = safe_div(
         out["payables"],
         out["claims_paid"] + out["commissions"] + out["brokerage_costs"] + out["direct_costs"] + out["indirect_costs"]
     ) * 365
+
+    # Classify receivable type (Insurance vs Non-Insurance)
+    insurance_lobs = ["Motor Insurance", "Property Insurance", "Marine Insurance", "Medical Insurance",
+                      "Engineering Insurance", "Liability Insurance", "Travel Insurance", "Life Insurance (Group)"]
+    out["receivable_type"] = out["group_of_product"].apply(
+        lambda x: "Insurance" if x in insurance_lobs else "Non-Insurance"
+    )
 
     return out
 
@@ -497,6 +500,7 @@ def detect_outliers(df: pd.DataFrame, value_col: str = "gross_written_premium",
     work = df.copy()
     work["is_outlier"] = False
     work["outlier_score"] = np.nan
+    work["outlier_explanation"] = ""
 
     if work.empty:
         return work
@@ -510,16 +514,14 @@ def detect_outliers(df: pd.DataFrame, value_col: str = "gross_written_premium",
             scores = model.score_samples(X)
             work["is_outlier"] = preds == -1
             work["outlier_score"] = -scores
-            # Add renewal risk (new)
             if not work.empty:
                 max_score = work["outlier_score"].max()
                 work["renewal_risk"] = 0.0
                 if max_score > 0:
-                    work["renewal_risk"] = work["outlier_score"] / max_score  # 0-1 scale
-                    # convert to probability-like: higher score = higher risk
+                    work["renewal_risk"] = work["outlier_score"] / max_score
             return work
         except ImportError:
-            method = "Z-Score"  # graceful fallback if scikit-learn isn't installed
+            method = "Z-Score"
 
     for _, gdf in work.groupby(group_cols):
         vals = gdf[value_col]
@@ -537,12 +539,23 @@ def detect_outliers(df: pd.DataFrame, value_col: str = "gross_written_premium",
         work.loc[gdf.index, "is_outlier"] = flags
         work.loc[gdf.index, "outlier_score"] = score
 
-    # Add renewal risk (new)
     if not work.empty:
         max_score = work["outlier_score"].max()
         work["renewal_risk"] = 0.0
         if max_score > 0:
-            work["renewal_risk"] = work["outlier_score"] / max_score  # 0-1 scale
+            work["renewal_risk"] = work["outlier_score"] / max_score
+
+    # Generate explanation for outliers
+    for idx, row in work[work["is_outlier"]].iterrows():
+        group_vals = work[work[group_cols[0]] == row[group_cols[0]]][value_col]
+        mean_val = group_vals.mean()
+        std_val = group_vals.std()
+        z_score = (row[value_col] - mean_val) / std_val if std_val else 0
+        work.loc[idx, "outlier_explanation"] = (
+            f"Value {fmt_omr(row[value_col])} is {abs(z_score):.1f} standard deviations from the group mean "
+            f"({fmt_omr(mean_val)}). This may indicate a large policy, data entry error, or significant shift."
+        )
+
     return work
 
 
@@ -1014,7 +1027,6 @@ def _generate_portfolio_pdf(df: pd.DataFrame, variance: dict, insights_text: str
     story.append(t)
     story.append(Spacer(1, 0.5 * cm))
 
-    # --- AI Executive Insights (always included in the portfolio PDF) ---
     story.append(Paragraph("AI Executive Insights", styles["Heading2"]))
     for line in insights_text.split("\n"):
         clean = line.replace("**", "")
@@ -1112,11 +1124,10 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
     story.append(kt)
     story.append(Spacer(1, 0.25 * cm))
 
-    # --- NEW: KPI Deep Dive (interpretations) ---
+    # ---- KPI Deep Dive (interpretations) ----
     story.append(Paragraph("KPI Deep Dive – Business Implications", section_style))
     story.append(HRFlowable(width="100%", color=colors.HexColor("#1f4e79"), thickness=1))
     for name, value in kpi_values.items():
-        # extract numeric value for interpretation
         num_val = None
         if "Ratio" in name or "Margin" in name:
             try:
@@ -1128,15 +1139,12 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
                 num_val = float(value.replace(",",""))
             except:
                 pass
-        else:
-            # for currency, we can skip numeric interpretation or extract
-            pass
         if num_val is not None:
             insight = kpi_interpretation(name, num_val)
             story.append(Paragraph(f"<b>{name}:</b> {insight}", body_style))
     story.append(Spacer(1, 0.3 * cm))
 
-    # Graphical KPI view — key ratios plotted as a bar chart
+    # Graphical KPI view
     ratio_labels = ["Loss Ratio", "Expense Ratio", "Combined Ratio", "Claims Ratio",
                      "Collection Ratio", "Profit Margin"]
     ratio_values = [
@@ -1234,7 +1242,6 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
         ]))
         story.append(lt)
 
-        # Combined ratio health note (auto-generated, deterministic)
         cr_mean = np.nanmean(lob_df["combined_ratio"])
         if not np.isnan(cr_mean):
             note = ("underwriting profitable" if cr_mean <= 100 else "running an underwriting loss —"
@@ -1258,13 +1265,11 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
     story.append(Paragraph("Production Forecast", section_style))
     story.append(HRFlowable(width="100%", color=colors.HexColor("#1f4e79"), thickness=1))
     story.append(Spacer(1, 0.3 * cm))
-    # Force horizon = 12 for management report
     horizon = 12
     fdf = forecast_metrics(kpi, horizon=horizon)
     if fdf.empty:
         story.append(Paragraph("Not enough historical data to forecast (need at least 4 months).", body_style))
     else:
-        # Filter historical to last 24 months (if available)
         hist = fdf[fdf["type"] == "Historical"]
         if len(hist) > 24:
             hist = hist.iloc[-24:]
@@ -1298,7 +1303,7 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
 
     story.append(Spacer(1, 0.5 * cm))
 
-    # ---- Outlier Impact on Renewals ----
+    # ---- Outlier Impact on Renewals (with detailed commentary) ----
     story.append(Paragraph("Outlier Impact on Renewals", section_style))
     story.append(HRFlowable(width="100%", color=colors.HexColor("#1f4e79"), thickness=1))
     outlier_df = detect_outliers(kpi, method=cfg.get("outlier_method", "Z-Score"),
@@ -1309,30 +1314,121 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
     else:
         story.append(Paragraph(
             f"Total flagged exceptions: {len(flagged)}. The table below shows each outlier's renewal risk "
-            f"(higher score = higher probability of non‑renewal) and a recommended action.",
+            f"(higher score = higher probability of non‑renewal) and detailed commentary.",
             body_style))
-        out_table_data = [["Branch", "Product", "Metric", "Score", "Renewal Risk", "Recommendation"]]
+        out_table_data = [["Branch", "Product", "Metric", "Score", "Risk", "Explanation"]]
         for _, row in flagged.iterrows():
             risk = row.get("renewal_risk", 0.0)
             risk_pct = f"{risk*100:.0f}%" if risk > 0 else "N/A"
-            rec = outlier_renewal_comment(row)
+            explanation = row.get("outlier_explanation", "No explanation available.")
+            # Truncate explanation for PDF
+            if len(explanation) > 60:
+                explanation = explanation[:60] + "..."
             out_table_data.append([
                 row.get("branch", "N/A"),
                 row.get("product", "N/A"),
-                row.get("gross_written_premium", 0),
+                fmt_omr(row.get("gross_written_premium", 0)),
                 f"{row['outlier_score']:.2f}",
                 risk_pct,
-                rec
+                explanation
             ])
-        out_tbl = Table(out_table_data, colWidths=[3*cm, 4*cm, 3.5*cm, 2*cm, 2.5*cm, 4*cm], repeatRows=1)
+        out_tbl = Table(out_table_data, colWidths=[2.5*cm, 3*cm, 3*cm, 1.5*cm, 2*cm, 5*cm], repeatRows=1)
         out_tbl.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("FONTSIZE", (0, 0), (-1, -1), 6.5),
             ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F9FC")]),
         ]))
         story.append(out_tbl)
+    story.append(Spacer(1, 0.5 * cm))
+
+    # ---- Receivables & Payables Deep Dive ----
+    story.append(Paragraph("Receivables & Payables Analysis", section_style))
+    story.append(HRFlowable(width="100%", color=colors.HexColor("#1f4e79"), thickness=1))
+    story.append(Spacer(1, 0.3 * cm))
+
+    # Split by Insurance/Non-Insurance
+    rec_insurance = kpi[kpi["receivable_type"] == "Insurance"]["receivables"].sum()
+    rec_non_insurance = kpi[kpi["receivable_type"] == "Non-Insurance"]["receivables"].sum()
+    pay_insurance = kpi[kpi["receivable_type"] == "Insurance"]["payables"].sum()
+    pay_non_insurance = kpi[kpi["receivable_type"] == "Non-Insurance"]["payables"].sum()
+
+    rec_table_data = [
+        ["Type", "Receivables", "Payables"],
+        ["Insurance", fmt_omr(rec_insurance), fmt_omr(pay_insurance)],
+        ["Non-Insurance", fmt_omr(rec_non_insurance), fmt_omr(pay_non_insurance)],
+        ["Total", fmt_omr(rec_insurance+rec_non_insurance), fmt_omr(pay_insurance+pay_non_insurance)]
+    ]
+    rt = Table(rec_table_data, colWidths=[5*cm, 5*cm, 5*cm])
+    rt.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F9FC")]),
+    ]))
+    story.append(rt)
+    story.append(Spacer(1, 0.3 * cm))
+
+    # Product-wise Receivables KPIs
+    story.append(Paragraph("Product-wise Receivables KPIs", styles["Heading3"]))
+    product_rec = kpi.groupby("product", as_index=False).agg(
+        total_receivables=("receivables", "sum"),
+        avg_days=("avg_receivables_days", "mean"),
+        count=("receivables", "count")
+    ).sort_values("total_receivables", ascending=False)
+    product_rec["avg_days"] = product_rec["avg_days"].apply(lambda x: fmt_num(x))
+    product_rec["total_receivables"] = product_rec["total_receivables"].apply(lambda x: fmt_omr(x))
+    prod_rec_table_data = [["Product", "Total Receivables", "Avg Days", "Records"]] + product_rec.head(10).values.tolist()
+    prt = Table(prod_rec_table_data, colWidths=[4*cm, 3.5*cm, 2.5*cm, 2*cm])
+    prt.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F9FC")]),
+    ]))
+    story.append(prt)
+    story.append(Spacer(1, 0.3 * cm))
+
+    # Top 10 Receivables Accounts (by branch)
+    story.append(Paragraph("Top 10 Receivables Accounts (by Branch)", styles["Heading3"]))
+    top_rec = kpi.groupby("branch", as_index=False)["receivables"].sum().sort_values("receivables", ascending=False).head(10)
+    top_rec["receivables"] = top_rec["receivables"].apply(lambda x: fmt_omr(x))
+    top_rec_table = [["Branch", "Receivables"]] + top_rec.values.tolist()
+    trt = Table(top_rec_table, colWidths=[6*cm, 6*cm])
+    trt.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F9FC")]),
+    ]))
+    story.append(trt)
+    story.append(Spacer(1, 0.3 * cm))
+
+    # Top 10 Payables Accounts
+    story.append(Paragraph("Top 10 Payables Accounts (by Branch)", styles["Heading3"]))
+    top_pay = kpi.groupby("branch", as_index=False)["payables"].sum().sort_values("payables", ascending=False).head(10)
+    top_pay["payables"] = top_pay["payables"].apply(lambda x: fmt_omr(x))
+    top_pay_table = [["Branch", "Payables"]] + top_pay.values.tolist()
+    tpt = Table(top_pay_table, colWidths=[6*cm, 6*cm])
+    tpt.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F9FC")]),
+    ]))
+    story.append(tpt)
+    story.append(Spacer(1, 0.3 * cm))
+
+    # AI Commentary on Receivables/Payables (built-in)
+    rec_commentary = generate_receivables_commentary(kpi)
+    story.append(Paragraph("AI Commentary on Receivables & Payables", styles["Heading3"]))
+    for line in rec_commentary.split("\n"):
+        story.append(Paragraph(line, body_style))
     story.append(Spacer(1, 0.5 * cm))
 
     story.append(Paragraph(
@@ -1566,6 +1662,53 @@ def render_ai_insights_and_export(role: str, df: pd.DataFrame, cfg: dict):
 
 
 # =============================================================================
+# NEW: AI Commentary for Receivables & Payables (Built-in)
+# =============================================================================
+
+def generate_receivables_commentary(kpi: pd.DataFrame) -> str:
+    """Generate built-in commentary on receivables and payables metrics."""
+    lines = []
+    total_rec = kpi["receivables"].sum()
+    total_pay = kpi["payables"].sum()
+    avg_rec_days = np.nanmean(kpi["avg_receivables_days"])
+    avg_pay_days = np.nanmean(kpi["net_payables_days"])
+
+    lines.append(f"• Total receivables stand at **{fmt_omr(total_rec)}**, with average days outstanding of **{avg_rec_days:.0f}** days.")
+    lines.append(f"• Total payables are **{fmt_omr(total_pay)}**, with average settlement days of **{avg_pay_days:.0f}** days.")
+
+    if avg_rec_days > 60:
+        lines.append("• ⚠️ Receivables days exceed 60 – consider tightening credit terms and accelerating collection.")
+    elif avg_rec_days > 40:
+        lines.append("• Receivables days are moderately high; monitor aging closely.")
+    else:
+        lines.append("• Receivables days are healthy; collection efficiency is good.")
+
+    if avg_pay_days > 45:
+        lines.append("• Payables days are high; review supplier payment terms to avoid strain on relationships.")
+    elif avg_pay_days < 20:
+        lines.append("• Payables days are very low – you might be paying suppliers too early; consider negotiating longer terms.")
+    else:
+        lines.append("• Payables days are within normal range.")
+
+    # Insurance vs Non-Insurance
+    rec_ins = kpi[kpi["receivable_type"] == "Insurance"]["receivables"].sum()
+    rec_non = kpi[kpi["receivable_type"] == "Non-Insurance"]["receivables"].sum()
+    lines.append(f"• Insurance receivables: **{fmt_omr(rec_ins)}**; Non-Insurance: **{fmt_omr(rec_non)}**.")
+    if rec_non > rec_ins * 0.3:
+        lines.append("• Non-Insurance receivables represent a significant portion – ensure proper credit assessment for these accounts.")
+
+    # Top 10 branches with highest receivables
+    top_branches = kpi.groupby("branch")["receivables"].sum().sort_values(ascending=False).head(3)
+    top_str = ", ".join([f"{b} ({fmt_omr(v)})" for b, v in top_branches.items()])
+    lines.append(f"• Top branches with highest receivables: {top_str}.")
+
+    # Recommendations
+    lines.append("• **Recommendation:** Prioritize collection efforts on branches with aging > 60 days and review credit limits for Non-Insurance products.")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
 # STREAMLIT APP CONFIG / STYLE
 # =============================================================================
 
@@ -1590,6 +1733,10 @@ CUSTOM_CSS = """
         display:inline-block; padding:2px 10px; border-radius:12px;
         background:#1f4e79; color:white; font-size:0.75rem; font-weight:600;
     }
+    .top-filter-bar {
+        background-color: white; padding: 10px 15px; border-radius: 8px;
+        border: 1px solid #e6e9ef; margin-bottom: 20px;
+    }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -1603,6 +1750,7 @@ def init_state():
     st.session_state.setdefault("authenticated", False)
     st.session_state.setdefault("user", None)
     st.session_state.setdefault("page", "Home Dashboard")
+    st.session_state.setdefault("filters", {})  # Global filters
 
 
 init_state()
@@ -1647,10 +1795,10 @@ def login_screen():
 
 
 # =============================================================================
-# SIDEBAR / FILTERS
+# SIDEBAR NAVIGATION
 # =============================================================================
 
-def sidebar_nav(cfg: dict, hierarchy: pd.DataFrame):
+def sidebar_nav(cfg: dict):
     user = st.session_state["user"]
     st.sidebar.markdown(f"### 📊 {APP_NAME}")
     st.sidebar.markdown(f"**{cfg['company_name']}**")
@@ -1663,35 +1811,52 @@ def sidebar_nav(cfg: dict, hierarchy: pd.DataFrame):
 
     pages = ["Home Dashboard", "Setup", "Data Upload", "CEO View", "COO View", "CFO View",
               "Outlier Detection", "Forecasting", "Budget vs Actual vs Forecast",
-              "Receivables & Payables",    # <-- new page
-              "AI Insights", "Reports"]
+              "Receivables & Payables", "AI Insights", "Reports"]
     if user["role"] == "Admin":
         pages.append("Admin / Configuration")
     page = st.sidebar.radio("Navigate", pages, index=pages.index(st.session_state["page"])
                              if st.session_state["page"] in pages else 0)
     st.session_state["page"] = page
+    return page
 
-    st.sidebar.divider()
-    st.sidebar.markdown("#### Filters")
+
+# =============================================================================
+# TOP FILTERS (Global)
+# =============================================================================
+
+def render_top_filters(hierarchy: pd.DataFrame):
+    """Render a horizontal bar with filters at the top of the page."""
+    st.markdown('<div class="top-filter-bar">', unsafe_allow_html=True)
+    cols = st.columns([1, 1, 1, 1, 1, 1, 1])
     df = load_data()
     filters = {}
+
     if not df.empty:
-        years = sorted(df["year"].dropna().unique().tolist())
-        filters["year"] = st.sidebar.multiselect("Year", years, default=years)
-        months = sorted(df["month"].dropna().unique().tolist())
-        filters["month"] = st.sidebar.multiselect("Month", months, default=months)
+        with cols[0]:
+            years = sorted(df["year"].dropna().unique().tolist())
+            filters["year"] = st.multiselect("Year", years, default=st.session_state.filters.get("year", years), key="filter_year")
+        with cols[1]:
+            months = sorted(df["month"].dropna().unique().tolist())
+            filters["month"] = st.multiselect("Month", months, default=st.session_state.filters.get("month", months), key="filter_month")
         if not hierarchy.empty:
-            groups = sorted(hierarchy["group_of_product"].unique().tolist())
-            filters["group_of_product"] = st.sidebar.multiselect("Line of Business / Group", groups, default=groups)
-            # Product and Sub-product filters
-            products = sorted(df["product"].dropna().unique().tolist())
-            filters["product"] = st.sidebar.multiselect("Product", products, default=products)
-            sub_products = sorted(df["sub_product"].dropna().unique().tolist())
-            filters["sub_product"] = st.sidebar.multiselect("Sub-Product", sub_products, default=sub_products)
-        for col, label in [("branch", "Branch"), ("channel", "Channel"), ("agent", "Agent")]:
-            vals = sorted(df[col].dropna().unique().tolist())
-            filters[col] = st.sidebar.multiselect(label, vals, default=vals)
-    return page, filters
+            with cols[2]:
+                groups = sorted(hierarchy["group_of_product"].unique().tolist())
+                filters["group_of_product"] = st.multiselect("LOB", groups, default=st.session_state.filters.get("group_of_product", groups), key="filter_lob")
+            with cols[3]:
+                products = sorted(df["product"].dropna().unique().tolist())
+                filters["product"] = st.multiselect("Product", products, default=st.session_state.filters.get("product", products), key="filter_product")
+            with cols[4]:
+                sub_products = sorted(df["sub_product"].dropna().unique().tolist())
+                filters["sub_product"] = st.multiselect("Sub-Product", sub_products, default=st.session_state.filters.get("sub_product", sub_products), key="filter_sub")
+        with cols[5]:
+            branches = sorted(df["branch"].dropna().unique().tolist())
+            filters["branch"] = st.multiselect("Branch", branches, default=st.session_state.filters.get("branch", branches), key="filter_branch")
+        with cols[6]:
+            channels = sorted(df["channel"].dropna().unique().tolist())
+            filters["channel"] = st.multiselect("Channel", channels, default=st.session_state.filters.get("channel", channels), key="filter_channel")
+    st.session_state.filters = filters
+    st.markdown('</div>', unsafe_allow_html=True)
+    return filters
 
 
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
@@ -1717,7 +1882,6 @@ def generate_chart_commentary(df: pd.DataFrame, chart_type: str, metric: str, ti
     if df.empty:
         return "No data available for commentary."
     if chart_type == "trend":
-        # assumes df has a datetime 'period' column and metric column
         sorted_df = df.sort_values("period")
         latest = sorted_df[metric].iloc[-1]
         earliest = sorted_df[metric].iloc[0]
@@ -1725,7 +1889,6 @@ def generate_chart_commentary(df: pd.DataFrame, chart_type: str, metric: str, ti
         direction = "increased" if change > 0 else "decreased" if change < 0 else "remained stable"
         return f"Over the period shown, {metric.replace('_',' ').title()} {direction} by {abs(change):.1f}%, from {fmt_omr(earliest)} to {fmt_omr(latest)}."
     elif chart_type == "bar_by_group":
-        # find top and bottom performers
         max_row = df.loc[df[metric].idxmax()]
         min_row = df.loc[df[metric].idxmin()]
         return f"The highest {metric.replace('_',' ').title()} is **{max_row.iloc[0]}** ({fmt_omr(max_row[metric])}), while the lowest is **{min_row.iloc[0]}** ({fmt_omr(min_row[metric])})."
@@ -1849,93 +2012,136 @@ def page_receivables_payables(df: pd.DataFrame, cfg: dict):
 
     st.markdown("---")
 
-    # ---- Aging Analysis ----
-    # We'll create aging buckets based on receivables relative to GWP (simulate days)
-    # For demo, we assign each row a random aging bucket based on its receivables/GWP ratio
-    # In a real scenario, you'd have actual invoice dates. Here we simulate.
-    # We'll create a function to assign aging buckets.
-    def assign_aging_bucket(row):
-        ratio = row["receivables"] / (row["gross_written_premium"] + 1)  # avoid zero
-        # Simulate aging: the higher the ratio, the older the receivables
-        # We'll bucket by ratio thresholds: <0.1 = 0-30, 0.1-0.2 = 31-60, 0.2-0.35 = 61-90, >0.35 = 90+
-        if ratio < 0.1:
-            return "0-30 days"
-        elif ratio < 0.2:
-            return "31-60 days"
-        elif ratio < 0.35:
-            return "61-90 days"
+    # ---- Tabs: Receivables, Payables ----
+    tab1, tab2 = st.tabs(["📊 Receivables Analysis", "📊 Payables Analysis"])
+
+    with tab1:
+        st.subheader("Receivables Aging & Risk")
+        # Aging buckets
+        def assign_aging_bucket(row):
+            ratio = row["receivables"] / (row["gross_written_premium"] + 1)
+            if ratio < 0.1:
+                return "0-30 days"
+            elif ratio < 0.2:
+                return "31-60 days"
+            elif ratio < 0.35:
+                return "61-90 days"
+            else:
+                return "90+ days"
+
+        kpi["aging_bucket"] = kpi.apply(assign_aging_bucket, axis=1)
+
+        def assign_risk(row):
+            bucket = row["aging_bucket"]
+            if bucket == "0-30 days":
+                return "Low"
+            elif bucket == "31-60 days":
+                return "Medium"
+            elif bucket == "61-90 days":
+                return "High"
+            else:
+                return "Critical"
+
+        kpi["risk_category"] = kpi.apply(assign_risk, axis=1)
+
+        aging_summary = kpi.groupby("aging_bucket", as_index=False).agg(
+            count=("receivables", "count"),
+            total_receivables=("receivables", "sum"),
+            avg_days=("avg_receivables_days", "mean")
+        ).sort_values("aging_bucket", key=lambda x: x.map({"0-30 days":0, "31-60 days":1, "61-90 days":2, "90+ days":3}))
+
+        st.dataframe(aging_summary, use_container_width=True, hide_index=True)
+
+        risk_summary = kpi.groupby("risk_category", as_index=False).agg(
+            count=("receivables", "count"),
+            total_receivables=("receivables", "sum")
+        ).sort_values("risk_category", key=lambda x: x.map({"Low":0, "Medium":1, "High":2, "Critical":3}))
+
+        st.dataframe(risk_summary, use_container_width=True, hide_index=True)
+
+        # Charts
+        col1, col2 = st.columns(2)
+        with col1:
+            fig_aging = px.bar(aging_summary, x="aging_bucket", y="total_receivables",
+                               title="Receivables by Aging Bucket", color="aging_bucket",
+                               text_auto=True)
+            st.plotly_chart(fig_aging, use_container_width=True)
+        with col2:
+            fig_risk = px.pie(risk_summary, names="risk_category", values="total_receivables",
+                              title="Receivables Risk Distribution", hole=0.4)
+            st.plotly_chart(fig_risk, use_container_width=True)
+
+        # Insurance vs Non-Insurance split
+        rec_insurance = kpi[kpi["receivable_type"] == "Insurance"]["receivables"].sum()
+        rec_non = kpi[kpi["receivable_type"] == "Non-Insurance"]["receivables"].sum()
+        st.metric("Insurance Receivables", fmt_omr(rec_insurance))
+        st.metric("Non-Insurance Receivables", fmt_omr(rec_non))
+
+        # Top 10 accounts (by branch, agent, product)
+        st.subheader("Top 10 Receivables Accounts")
+        top_rec_branch = kpi.groupby("branch")["receivables"].sum().sort_values(ascending=False).head(10).reset_index()
+        top_rec_branch.columns = ["Branch", "Receivables"]
+        top_rec_branch["Receivables"] = top_rec_branch["Receivables"].apply(lambda x: fmt_omr(x))
+        st.dataframe(top_rec_branch, use_container_width=True, hide_index=True)
+
+        # Comment on risk
+        st.subheader("Risk Commentary")
+        high_risk = kpi[kpi["risk_category"].isin(["High", "Critical"])]
+        if not high_risk.empty:
+            st.warning(f"⚠️ {len(high_risk)} records have High/Critical risk. Focus collection efforts on these accounts.")
         else:
-            return "90+ days"
+            st.success("No high-risk receivables detected.")
 
-    kpi["aging_bucket"] = kpi.apply(assign_aging_bucket, axis=1)
+    with tab2:
+        st.subheader("Payables Analysis")
+        # Similar for payables: aging, risk, top accounts
+        # For payables, we can use a similar aging based on payables/GWP ratio
+        def assign_payable_bucket(row):
+            ratio = row["payables"] / (row["claims_paid"] + row["commissions"] + row["brokerage_costs"] + row["direct_costs"] + row["indirect_costs"] + 1)
+            if ratio < 0.1:
+                return "0-30 days"
+            elif ratio < 0.2:
+                return "31-60 days"
+            elif ratio < 0.35:
+                return "61-90 days"
+            else:
+                return "90+ days"
 
-    # Also assign risk category based on aging and receivables amount
-    def assign_risk(row):
-        bucket = row["aging_bucket"]
-        if bucket == "0-30 days":
-            return "Low"
-        elif bucket == "31-60 days":
-            return "Medium"
-        elif bucket == "61-90 days":
-            return "High"
-        else:
-            return "Critical"
+        kpi["payable_bucket"] = kpi.apply(assign_payable_bucket, axis=1)
 
-    kpi["risk_category"] = kpi.apply(assign_risk, axis=1)
+        pay_aging = kpi.groupby("payable_bucket", as_index=False).agg(
+            count=("payables", "count"),
+            total_payables=("payables", "sum"),
+            avg_days=("net_payables_days", "mean")
+        ).sort_values("payable_bucket", key=lambda x: x.map({"0-30 days":0, "31-60 days":1, "61-90 days":2, "90+ days":3}))
 
-    # ---- Aging Summary ----
-    aging_summary = kpi.groupby("aging_bucket", as_index=False).agg(
-        count=("receivables", "count"),
-        total_receivables=("receivables", "sum"),
-        avg_days=("avg_receivables_days", "mean")
-    ).sort_values("aging_bucket", key=lambda x: x.map({"0-30 days":0, "31-60 days":1, "61-90 days":2, "90+ days":3}))
+        st.dataframe(pay_aging, use_container_width=True, hide_index=True)
 
-    st.subheader("Receivables Aging Summary")
-    st.dataframe(aging_summary, use_container_width=True, hide_index=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            fig_pay = px.bar(pay_aging, x="payable_bucket", y="total_payables",
+                             title="Payables by Aging Bucket", color="payable_bucket",
+                             text_auto=True)
+            st.plotly_chart(fig_pay, use_container_width=True)
 
-    # ---- Risk Categorization ----
-    risk_summary = kpi.groupby("risk_category", as_index=False).agg(
-        count=("receivables", "count"),
-        total_receivables=("receivables", "sum")
-    ).sort_values("risk_category", key=lambda x: x.map({"Low":0, "Medium":1, "High":2, "Critical":3}))
+        # Top 10 payables accounts
+        st.subheader("Top 10 Payables Accounts")
+        top_pay_branch = kpi.groupby("branch")["payables"].sum().sort_values(ascending=False).head(10).reset_index()
+        top_pay_branch.columns = ["Branch", "Payables"]
+        top_pay_branch["Payables"] = top_pay_branch["Payables"].apply(lambda x: fmt_omr(x))
+        st.dataframe(top_pay_branch, use_container_width=True, hide_index=True)
 
-    st.subheader("Receivables Risk Categorization")
-    st.dataframe(risk_summary, use_container_width=True, hide_index=True)
+        pay_insurance = kpi[kpi["receivable_type"] == "Insurance"]["payables"].sum()
+        pay_non = kpi[kpi["receivable_type"] == "Non-Insurance"]["payables"].sum()
+        st.metric("Insurance Payables", fmt_omr(pay_insurance))
+        st.metric("Non-Insurance Payables", fmt_omr(pay_non))
 
-    # ---- Charts ----
-    col1, col2 = st.columns(2)
-    with col1:
-        fig_aging = px.bar(aging_summary, x="aging_bucket", y="total_receivables",
-                           title="Receivables by Aging Bucket", color="aging_bucket",
-                           text_auto=True)
-        st.plotly_chart(fig_aging, use_container_width=True)
-    with col2:
-        fig_risk = px.pie(risk_summary, names="risk_category", values="total_receivables",
-                          title="Receivables Risk Distribution", hole=0.4)
-        st.plotly_chart(fig_risk, use_container_width=True)
-
-    # ---- Trend of Receivables and Payables over time ----
-    monthly = kpi.groupby(["year", "month"], as_index=False).agg(
-        receivables=("receivables", "sum"),
-        payables=("payables", "sum"),
-        gwp=("gross_written_premium", "sum")
-    ).sort_values(["year", "month"])
-    monthly["period"] = pd.to_datetime(dict(year=monthly.year, month=monthly.month, day=1))
-
-    fig_trend = go.Figure()
-    fig_trend.add_trace(go.Scatter(x=monthly["period"], y=monthly["receivables"],
-                                   mode="lines+markers", name="Receivables"))
-    fig_trend.add_trace(go.Scatter(x=monthly["period"], y=monthly["payables"],
-                                   mode="lines+markers", name="Payables"))
-    fig_trend.update_layout(title="Monthly Receivables & Payables Trend", yaxis_title="OMR")
-    st.plotly_chart(fig_trend, use_container_width=True)
-
-    # ---- Detailed Data with filters ----
-    st.markdown("#### Detailed Receivables & Payables Data")
-    # Add filters for product and sub_product already in sidebar
-    display_cols = ["year", "month", "group_of_product", "product", "sub_product", "branch",
-                    "receivables", "payables", "aging_bucket", "risk_category", "avg_receivables_days", "net_payables_days"]
-    st.dataframe(kpi[display_cols], use_container_width=True, hide_index=True)
+    # ---- AI Commentary ----
+    st.markdown("---")
+    st.subheader("🤖 AI Commentary on Receivables & Payables")
+    if st.button("Generate Commentary"):
+        commentary = generate_receivables_commentary(kpi)
+        st.markdown(commentary)
 
     # ---- Exports ----
     st.download_button("⬇️ Export Aging Summary (CSV)", export_csv(aging_summary),
@@ -1984,7 +2190,6 @@ def page_home(df: pd.DataFrame, cfg: dict):
         fig_donut = px.pie(production_by_lob, names="group_of_product", values="gross_written_premium",
                            hole=0.4, title="Production Mix by Line of Business")
         st.plotly_chart(fig_donut, use_container_width=True)
-        # commentary for donut
         commentary = generate_chart_commentary(production_by_lob, "pie_donut", "gross_written_premium", "")
         st.caption(commentary)
 
@@ -2003,7 +2208,6 @@ def page_home(df: pd.DataFrame, cfg: dict):
         fig2 = px.pie(by_group, names="group_of_product", values="gross_written_premium",
                        title="Premium Mix by Line of Business", hole=0.45)
         st.plotly_chart(fig2, use_container_width=True)
-        # additional commentary for pie
         commentary2 = generate_chart_commentary(by_group, "pie_donut", "gross_written_premium", "")
         st.caption(commentary2)
 
@@ -2014,8 +2218,7 @@ def page_home(df: pd.DataFrame, cfg: dict):
     if flagged.empty:
         st.success("No significant exceptions detected in the current filter.")
     else:
-        # show renewal risk column
-        display_cols = ["year", "month", "branch", "product", "gross_written_premium", "outlier_score", "renewal_risk"]
+        display_cols = ["year", "month", "branch", "product", "gross_written_premium", "outlier_score", "renewal_risk", "outlier_explanation"]
         display_df = flagged[display_cols].copy()
         display_df["renewal_risk"] = display_df["renewal_risk"].apply(lambda x: f"{x*100:.0f}%" if not pd.isna(x) else "N/A")
         st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -2172,7 +2375,6 @@ def page_ceo_view(df: pd.DataFrame, cfg: dict):
         st.caption(commentary_bar)
 
     with col2:
-        # Donut chart for production mix
         prod_by_lob = kpi.groupby("group_of_product", as_index=False)["gross_written_premium"].sum()
         fig_donut = px.pie(prod_by_lob, names="group_of_product", values="gross_written_premium",
                            hole=0.4, title="Production Mix")
@@ -2187,7 +2389,7 @@ def page_ceo_view(df: pd.DataFrame, cfg: dict):
     if top_exceptions.empty:
         st.success("No major exceptions.")
     else:
-        display_cols = ["branch", "product", "gross_written_premium", "outlier_score", "renewal_risk"]
+        display_cols = ["branch", "product", "gross_written_premium", "outlier_score", "renewal_risk", "outlier_explanation"]
         display_df = top_exceptions[display_cols].copy()
         display_df["renewal_risk"] = display_df["renewal_risk"].apply(lambda x: f"{x*100:.0f}%" if not pd.isna(x) else "N/A")
         st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -2234,7 +2436,7 @@ def page_coo_view(df: pd.DataFrame, cfg: dict):
                                 threshold=cfg.get("outlier_threshold", 3.0))
     flagged = outliers[outliers["is_outlier"]]
     if not flagged.empty:
-        display_cols = ["branch", "agent", "product", "gross_written_premium", "outlier_score", "renewal_risk"]
+        display_cols = ["branch", "agent", "product", "gross_written_premium", "outlier_score", "renewal_risk", "outlier_explanation"]
         display_df = flagged[display_cols].copy()
         display_df["renewal_risk"] = display_df["renewal_risk"].apply(lambda x: f"{x*100:.0f}%" if not pd.isna(x) else "N/A")
         st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -2258,7 +2460,6 @@ def page_cfo_view(df: pd.DataFrame, cfg: dict):
     c3.metric("Receivables", fmt_omr(kpi["receivables"].sum()))
     c4.metric("Collection Ratio", fmt_pct(kpi["collection_ratio"].mean()))
 
-    # Gauge for Loss Ratio
     loss_ratio_val = np.nanmean(kpi["loss_ratio"])
     st.plotly_chart(plot_gauge(loss_ratio_val, "Overall Loss Ratio (%)"), use_container_width=True)
 
@@ -2274,12 +2475,10 @@ def page_cfo_view(df: pd.DataFrame, cfg: dict):
             fig.add_trace(go.Scatter(x=trend["period"], y=trend[col_name], mode="lines+markers", name=label))
         fig.update_layout(title="Ratio Trends", yaxis_title="%")
         st.plotly_chart(fig, use_container_width=True)
-        # commentary for trend
-        commentary = generate_chart_commentary(trend, "trend", "loss_ratio", "")  # maybe use combined_ratio as well
+        commentary = generate_chart_commentary(trend, "trend", "loss_ratio", "")
         st.caption(commentary)
 
     with col2:
-        # Donut for receivables distribution by LOB (optional)
         rec_by_lob = kpi.groupby("group_of_product", as_index=False)["receivables"].sum()
         fig_donut = px.pie(rec_by_lob, names="group_of_product", values="receivables",
                            hole=0.4, title="Receivables by LOB")
@@ -2327,13 +2526,12 @@ def page_outliers(df: pd.DataFrame, cfg: dict):
                       title=f"Exception Chart — {value_col}")
     st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("#### Flagged Records with Renewal Risk")
+    st.markdown("#### Flagged Records with Renewal Risk & Commentary")
     cols_to_show = ["year", "month", "branch", "agent", "channel", "product", "sub_product",
-                     value_col, "outlier_score", "renewal_risk"]
+                     value_col, "outlier_score", "renewal_risk", "outlier_explanation"]
     if not flagged.empty:
         display_df = flagged[cols_to_show].copy()
         display_df["renewal_risk"] = display_df["renewal_risk"].apply(lambda x: f"{x*100:.0f}%" if not pd.isna(x) else "N/A")
-        # Add a commentary column
         display_df["Recommendation"] = flagged.apply(outlier_renewal_comment, axis=1)
         st.dataframe(display_df, use_container_width=True, hide_index=True)
     else:
@@ -2363,7 +2561,6 @@ def page_forecasting(df: pd.DataFrame, cfg: dict):
         st.warning("Not enough historical data to forecast (need at least 4 months).")
         return
 
-    # Filter historical to last 24 months
     hist = fdf[fdf["type"] == "Historical"]
     if len(hist) > 24:
         hist = hist.iloc[-24:]
@@ -2527,8 +2724,8 @@ def page_reports(df: pd.DataFrame, cfg: dict):
     with tab1:
         st.markdown(
             "A single rich, board-ready PDF covering: Executive Summary (AI Insights), a full "
-            "**KPI Dashboard with definitions**, detailed **Variance Analysis**, and the "
-            "**Production Forecast** — chart and table."
+            "**KPI Dashboard with definitions**, detailed **Variance Analysis**, **Product-wise Receivables KPIs**, "
+            "**Top 10 Accounts**, and **Outlier Impact on Renewals** with commentary."
         )
         if st.button("📘 Generate Full Management Report (PDF)", type="primary"):
             with st.spinner("Building the full management report..."):
@@ -2663,7 +2860,11 @@ def main():
 
     cfg = load_config()
     hierarchy = load_hierarchy()
-    page, filters = sidebar_nav(cfg, hierarchy)
+    page = sidebar_nav(cfg)
+
+    # Render top filters (global)
+    filters = render_top_filters(hierarchy)
+
     raw_df = load_data()
     df = apply_filters(raw_df, filters) if not raw_df.empty else raw_df
 
@@ -2680,6 +2881,10 @@ def main():
 
     if page == "Home Dashboard":
         page_home(df, cfg)
+    elif page == "Setup":
+        page_setup(cfg, hierarchy)
+    elif page == "Data Upload":
+        page_data_upload(hierarchy)
     elif page == "CEO View":
         page_ceo_view(df, cfg)
     elif page == "COO View":
@@ -2700,10 +2905,7 @@ def main():
         page_reports(df, cfg)
     elif page == "Admin / Configuration":
         page_admin(cfg, hierarchy)
-    elif page == "Setup":
-        page_setup(cfg, hierarchy)
-    elif page == "Data Upload":
-        page_data_upload(hierarchy)
+
 
 if __name__ == "__main__":
     main()
