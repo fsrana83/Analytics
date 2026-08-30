@@ -23,6 +23,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import requests  # NEW for Ollama
 
 # =============================================================================
 # CONSTANTS / BRANDING
@@ -32,6 +33,9 @@ APP_NAME = "Smart Analytics"
 CURRENCY_SYMBOL = "﷼"          # Official CBO Rial Omani symbol (see cbo.gov.om/omrsymbol)
 CURRENCY_CODE = "OMR"
 GEMINI_MODEL = "gemini-3.5-flash"
+DEFAULT_AI_PROVIDER = "gemini"   # 'gemini' | 'ollama'
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_OLLAMA_MODEL = "qwen3"
 DATA_DIR = "smart_analytics_data"
 HIERARCHY_FILE = os.path.join(DATA_DIR, "hierarchy.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
@@ -176,6 +180,10 @@ def load_config() -> dict:
         "outlier_method": "Z-Score",
         "outlier_threshold": 3.0,
         "forecast_horizon_months": 12,
+        # NEW AI provider settings
+        "ai_provider": DEFAULT_AI_PROVIDER,          # 'gemini' or 'ollama'
+        "ollama_base_url": DEFAULT_OLLAMA_URL,
+        "ollama_model": DEFAULT_OLLAMA_MODEL,
     }
     cfg = _load_json(CONFIG_FILE, default)
     for k, v in default.items():
@@ -595,21 +603,32 @@ def variance_analysis(df: pd.DataFrame) -> dict:
 
 
 # =============================================================================
-# AI INSIGHTS (Gemini)
+# AI INSIGHTS (Gemini / Ollama / Rule-based)
 # =============================================================================
 
-def generate_ai_insights(kpi_summary: dict, outliers_count: int, variance: dict,
-                          api_key: str = "", model_name: str = GEMINI_MODEL) -> str:
-    """Generate executive commentary. Uses Gemini if an API key is configured,
-    otherwise falls back to a deterministic rule-based summary so the app is
-    fully usable without any external AI dependency."""
+def is_ollama_available(base_url: str) -> bool:
+    """Return True if the Ollama server responds to /api/tags."""
+    try:
+        resp = requests.get(f"{base_url}/api/tags", timeout=2)
+        return resp.status_code == 200
+    except Exception:
+        return False
 
-    if api_key:
-        try:
-            return _generate_ai_insights_gemini(kpi_summary, outliers_count, variance, api_key, model_name)
-        except Exception as e:
-            st.warning(f"Gemini call failed, falling back to rule-based insights ({e}).")
 
+def _generate_ai_insights_ollama(prompt: str, base_url: str, model: str) -> str:
+    """Call Ollama's generate endpoint with the given prompt."""
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False
+    }
+    resp = requests.post(f"{base_url}/api/generate", json=payload, timeout=30)
+    resp.raise_for_status()
+    return resp.json().get("response", "")
+
+
+def _generate_rule_based_insights(kpi_summary: dict, outliers_count: int, variance: dict) -> str:
+    """Deterministic rule‑based commentary (fallback)."""
     lines = []
     vpct = variance.get("variance_pct", np.nan)
     if not np.isnan(vpct):
@@ -651,7 +670,7 @@ def _generate_ai_insights_gemini(kpi_summary: dict, outliers_count: int, varianc
 
     Requires: pip install google-generativeai
     Configure the API key via the Admin/Configuration screen or environment variable.
-    Default model: gemini-3.7-flash (override in Admin/Configuration).
+    Default model: gemini-3.5-flash (override in Admin/Configuration).
     """
     import google.generativeai as genai
 
@@ -669,6 +688,54 @@ Variance summary: {json.dumps({k: v for k, v in variance.items() if k not in ('b
 """
     response = model.generate_content(prompt)
     return response.text
+
+
+def generate_ai_insights(kpi_summary: dict, outliers_count: int, variance: dict,
+                          cfg: dict, provider_override: str = None) -> str:
+    """
+    Generate executive commentary. Uses the configured AI provider
+    (Gemini or Ollama) if available; otherwise falls back to rule-based.
+    """
+    provider = provider_override or cfg.get("ai_provider", DEFAULT_AI_PROVIDER)
+
+    if provider == "gemini":
+        api_key = cfg.get("gemini_api_key", "")
+        if api_key:
+            try:
+                gemini_text = _generate_ai_insights_gemini(
+                    kpi_summary, outliers_count, variance,
+                    api_key, cfg.get("gemini_model", GEMINI_MODEL)
+                )
+                return f"🧠 AI insights generated using **Gemini** ({cfg.get('gemini_model', GEMINI_MODEL)}):\n\n{gemini_text}"
+            except Exception as e:
+                st.warning(f"Gemini call failed: {e}. Falling back to rule‑based.")
+        else:
+            st.info("ℹ️ No Gemini API key configured. Falling back to rule‑based insights.")
+
+    elif provider == "ollama":
+        base_url = cfg.get("ollama_base_url", DEFAULT_OLLAMA_URL)
+        model = cfg.get("ollama_model", DEFAULT_OLLAMA_MODEL)
+        if is_ollama_available(base_url):
+            # Build the same prompt as Gemini uses
+            prompt = f"""You are the AI analyst for an insurance company's executive dashboard ("{APP_NAME}").
+Write a concise (4-6 bullet points) executive commentary in {CURRENCY_CODE} covering:
+what changed, why it changed, key risks, and recommended management actions.
+Round all figures to the nearest whole number.
+
+KPI summary: {json.dumps(kpi_summary, default=str)}
+Outliers flagged: {outliers_count}
+Variance summary: {json.dumps({k: v for k, v in variance.items() if k not in ('by_group',)}, default=str)}
+"""
+            try:
+                ollama_text = _generate_ai_insights_ollama(prompt, base_url, model)
+                return f"🧠 AI insights generated using **Ollama** (model: {model}):\n\n{ollama_text}"
+            except Exception as e:
+                st.warning(f"Ollama call failed: {e}. Falling back to rule‑based.")
+        else:
+            st.warning(f"Ollama server at {base_url} not reachable. Falling back to rule‑based.")
+
+    # Fallback: deterministic rule-based insights
+    return _generate_rule_based_insights(kpi_summary, outliers_count, variance)
 
 
 # =============================================================================
@@ -1189,7 +1256,7 @@ def generate_view_export(role: str, df: pd.DataFrame, cfg: dict, insights_text: 
     raise ValueError(f"Unsupported format: {fmt}")
 
 
-def render_ai_insights_and_export(role: str, df: pd.DataFrame, cfg: dict):
+def render_ai_insights_and_export(role: str, df: pd.DataFrame, cfg: dict, provider_override: str = None):
     """Shared block rendered at the bottom of each CEO/COO/CFO view: AI Insights
     (cached per role) plus PDF/PPTX export of that formatted view."""
     kpi = calculate_kpis(df)
@@ -1209,15 +1276,26 @@ def render_ai_insights_and_export(role: str, df: pd.DataFrame, cfg: dict):
     st.markdown("---")
     header_col, btn_col = st.columns([5, 1])
     header_col.markdown("### 🤖 AI Insights")
+    # Allow provider override on the fly
+    provider_opts = ["default", "gemini", "ollama"]
+    current_provider = provider_override or cfg.get("ai_provider", DEFAULT_AI_PROVIDER)
+    # Show current provider in a small label
+    if current_provider == "gemini":
+        provider_label = "Gemini" + (" (API)" if cfg.get("gemini_api_key") else " (no key)")
+    elif current_provider == "ollama":
+        provider_label = f"Ollama ({cfg.get('ollama_model', DEFAULT_OLLAMA_MODEL)})"
+    else:
+        provider_label = "Rule‑based (fallback)"
+    st.caption(f"Current AI provider: **{provider_label}**")
+
     if btn_col.button("🔄 Regenerate", key=f"regen_{role}"):
         st.session_state.pop(cache_key, None)
 
     if cache_key not in st.session_state:
         with st.spinner("Analyzing KPIs, outliers, and variances..."):
             st.session_state[cache_key] = generate_ai_insights(
-                kpi_summary, outliers_count, var,
-                api_key=cfg.get("gemini_api_key", ""),
-                model_name=cfg.get("gemini_model", GEMINI_MODEL))
+                kpi_summary, outliers_count, var, cfg, provider_override
+            )
     st.markdown(st.session_state[cache_key])
 
     st.markdown("##### 📤 Export this view")
@@ -1833,25 +1911,41 @@ def page_ai_insights(df: pd.DataFrame, cfg: dict):
         "profitability": kpi["profitability"].sum(),
     }
 
+    # Provider override selector
+    provider_override = st.selectbox(
+        "AI Provider (override)",
+        ["default", "gemini", "ollama"],
+        index=0,
+        help="Select 'default' to use the provider configured in Admin."
+    )
+    provider = provider_override if provider_override != "default" else cfg.get("ai_provider", DEFAULT_AI_PROVIDER)
+
     if st.button("🔄 Regenerate Insights", type="primary"):
         st.session_state.pop("_ai_insights_cache", None)
 
     if "_ai_insights_cache" not in st.session_state:
         with st.spinner("Analyzing KPIs, outliers, and variances..."):
             st.session_state["_ai_insights_cache"] = generate_ai_insights(
-                kpi_summary, outliers_count, var,
-                api_key=cfg.get("gemini_api_key", ""),
-                model_name=cfg.get("gemini_model", GEMINI_MODEL))
+                kpi_summary, outliers_count, var, cfg, provider_override if provider_override != "default" else None
+            )
 
     st.markdown(st.session_state["_ai_insights_cache"])
 
-    if not cfg.get("gemini_api_key"):
-        st.caption(
-            "ℹ️ Running in rule-based mode. Add a Gemini API key in **Admin / Configuration** "
-            f"to enable AI-generated narrative commentary (model: `{cfg.get('gemini_model', GEMINI_MODEL)}`)."
-        )
+    # Show status of the AI provider
+    if provider == "gemini":
+        if cfg.get("gemini_api_key"):
+            st.caption(f"ℹ️ Powered by Gemini `{cfg.get('gemini_model', GEMINI_MODEL)}`.")
+        else:
+            st.caption("ℹ️ Gemini API key not set. Using rule‑based insights.")
+    elif provider == "ollama":
+        base_url = cfg.get("ollama_base_url", DEFAULT_OLLAMA_URL)
+        model = cfg.get("ollama_model", DEFAULT_OLLAMA_MODEL)
+        if is_ollama_available(base_url):
+            st.caption(f"ℹ️ Powered by Ollama (model: {model}) at {base_url}.")
+        else:
+            st.caption(f"⚠️ Ollama server at {base_url} not reachable. Using rule‑based insights.")
     else:
-        st.caption(f"ℹ️ Powered by `{cfg.get('gemini_model', GEMINI_MODEL)}`.")
+        st.caption("ℹ️ Using rule‑based insights.")
 
 
 # =============================================================================
@@ -1929,17 +2023,53 @@ def page_admin(cfg: dict, hierarchy: pd.DataFrame):
 
     with tab1:
         with st.form("ai_settings_form"):
-            api_key = st.text_input("Gemini API Key", value=cfg.get("gemini_api_key", ""), type="password")
-            model_name = st.text_input("Gemini Model", value=cfg.get("gemini_model", GEMINI_MODEL))
+            # AI Provider
+            provider = st.selectbox(
+                "AI Provider",
+                ["gemini", "ollama"],
+                index=["gemini", "ollama"].index(cfg.get("ai_provider", DEFAULT_AI_PROVIDER))
+            )
+            if provider == "gemini":
+                api_key = st.text_input("Gemini API Key", value=cfg.get("gemini_api_key", ""), type="password")
+                model_name = st.text_input("Gemini Model", value=cfg.get("gemini_model", GEMINI_MODEL))
+                # Hide Ollama fields
+                ollama_url = cfg.get("ollama_base_url", DEFAULT_OLLAMA_URL)
+                ollama_model = cfg.get("ollama_model", DEFAULT_OLLAMA_MODEL)
+            else:  # ollama
+                ollama_url = st.text_input("Ollama Base URL", value=cfg.get("ollama_base_url", DEFAULT_OLLAMA_URL))
+                ollama_model = st.text_input("Ollama Model", value=cfg.get("ollama_model", DEFAULT_OLLAMA_MODEL))
+                # Hide Gemini fields
+                api_key = cfg.get("gemini_api_key", "")
+                model_name = cfg.get("gemini_model", GEMINI_MODEL)
+
+            # Outlier and forecast settings (common)
             method = st.selectbox("Default Outlier Method", ["Z-Score", "IQR", "Isolation Forest"],
                                    index=["Z-Score", "IQR", "Isolation Forest"].index(cfg.get("outlier_method", "Z-Score")))
             threshold = st.slider("Default Z-Score Threshold", 1.5, 5.0, float(cfg.get("outlier_threshold", 3.0)))
             horizon = st.slider("Default Forecast Horizon (months)", 3, 24, cfg.get("forecast_horizon_months", 12))
+
             if st.form_submit_button("Save", type="primary"):
-                cfg.update({"gemini_api_key": api_key, "gemini_model": model_name, "outlier_method": method,
-                            "outlier_threshold": threshold, "forecast_horizon_months": horizon})
+                cfg.update({
+                    "gemini_api_key": api_key,
+                    "gemini_model": model_name,
+                    "ai_provider": provider,
+                    "ollama_base_url": ollama_url,
+                    "ollama_model": ollama_model,
+                    "outlier_method": method,
+                    "outlier_threshold": threshold,
+                    "forecast_horizon_months": horizon,
+                })
                 save_config(cfg)
                 st.success("Configuration saved.")
+
+        # Test Ollama connectivity (if provider is ollama)
+        if cfg.get("ai_provider") == "ollama":
+            base_url = cfg.get("ollama_base_url", DEFAULT_OLLAMA_URL)
+            if st.button("Test Ollama Connection"):
+                if is_ollama_available(base_url):
+                    st.success(f"✅ Ollama server at {base_url} is reachable.")
+                else:
+                    st.error(f"❌ Cannot reach Ollama at {base_url}. Make sure it's running and the URL is correct.")
 
     with tab2:
         users = load_users()
