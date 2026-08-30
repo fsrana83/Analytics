@@ -196,7 +196,7 @@ def _hash_pw(password: str) -> str:
 def load_users() -> dict:
     default = {
         "admin": {"name": "System Administrator", "role": "Admin",
-                   "password_hash": _hash_pw("admin123"), "email": "admin@smartanalytics.local"},
+                   "password_hash": _hash_pw("admin1234"), "email": "admin@smartanalytics.local"},
         "ceo": {"name": "Chief Executive Officer", "role": "CEO",
                 "password_hash": _hash_pw("ceo123"), "email": "ceo@smartanalytics.local"},
         "coo": {"name": "Chief Operating Officer", "role": "COO",
