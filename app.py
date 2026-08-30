@@ -16,14 +16,13 @@ import json
 import os
 import hashlib
 import datetime as dt
-from typing import Optional, List, Dict
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-import requests  # for Ollama
 
 # =============================================================================
 # CONSTANTS / BRANDING
@@ -32,16 +31,12 @@ import requests  # for Ollama
 APP_NAME = "Smart Analytics"
 CURRENCY_SYMBOL = "﷼"          # Official CBO Rial Omani symbol (see cbo.gov.om/omrsymbol)
 CURRENCY_CODE = "OMR"
-GEMINI_MODEL = "gemini-3.5-flash"
-DEFAULT_AI_PROVIDER = "gemini"   # 'gemini' | 'ollama'
-DEFAULT_OLLAMA_URL = "http://localhost:11434"
-DEFAULT_OLLAMA_MODEL = "qwen3"
+GEMINI_MODEL = "gemini-3.7-flash"
 DATA_DIR = "smart_analytics_data"
 HIERARCHY_FILE = os.path.join(DATA_DIR, "hierarchy.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 DATA_FILE = os.path.join(DATA_DIR, "transactions.csv")
-FEEDBACK_FILE = os.path.join(DATA_DIR, "feedback.json")
 
 REQUIRED_COLUMNS = [
     "month", "year", "group_of_product", "product", "sub_product",
@@ -176,14 +171,12 @@ def load_config() -> dict:
         "company_name": "A Demo Insurance",
         "currency_label": f"{CURRENCY_CODE} ({CURRENCY_SYMBOL})",
         "fiscal_year_start_month": 1,
+        "ai_provider": "Built-in AI (Free)",
         "gemini_api_key": "",
         "gemini_model": GEMINI_MODEL,
         "outlier_method": "Z-Score",
         "outlier_threshold": 3.0,
         "forecast_horizon_months": 12,
-        "ai_provider": DEFAULT_AI_PROVIDER,
-        "ollama_base_url": DEFAULT_OLLAMA_URL,
-        "ollama_model": DEFAULT_OLLAMA_MODEL,
     }
     cfg = _load_json(CONFIG_FILE, default)
     for k, v in default.items():
@@ -195,30 +188,6 @@ def save_config(cfg: dict) -> None:
     _save_json(CONFIG_FILE, cfg)
 
 
-# ---- Feedback / Recommendations ---------------------------------------------
-
-def load_feedback() -> List[Dict]:
-    """Load all feedback entries."""
-    default = []
-    return _load_json(FEEDBACK_FILE, default)
-
-
-def save_feedback(feedback: List[Dict]) -> None:
-    _save_json(FEEDBACK_FILE, feedback)
-
-
-def add_feedback(username: str, text: str, category: str = "General") -> None:
-    feedback = load_feedback()
-    feedback.append({
-        "username": username,
-        "timestamp": dt.datetime.now().isoformat(),
-        "category": category,
-        "text": text,
-        "status": "new",   # new, read, resolved
-    })
-    save_feedback(feedback)
-
-
 # ---- Users / auth ------------------------------------------------------------
 
 def _hash_pw(password: str) -> str:
@@ -228,7 +197,7 @@ def _hash_pw(password: str) -> str:
 def load_users() -> dict:
     default = {
         "admin": {"name": "System Administrator", "role": "Admin",
-                   "password_hash": _hash_pw("admin1234"), "email": "admin@smartanalytics.local"},
+                   "password_hash": _hash_pw("admin123"), "email": "admin@smartanalytics.local"},
         "ceo": {"name": "Chief Executive Officer", "role": "CEO",
                 "password_hash": _hash_pw("ceo123"), "email": "ceo@smartanalytics.local"},
         "coo": {"name": "Chief Operating Officer", "role": "COO",
@@ -534,7 +503,7 @@ def detect_outliers(df: pd.DataFrame, value_col: str = "gross_written_premium",
 
 
 # =============================================================================
-# FORECASTING (monthly)
+# FORECASTING
 # =============================================================================
 
 def forecast_metrics(df: pd.DataFrame, value_col: str = "gross_written_premium",
@@ -627,32 +596,32 @@ def variance_analysis(df: pd.DataFrame) -> dict:
 
 
 # =============================================================================
-# AI INSIGHTS (Gemini / Ollama / Rule-based) + Q&A
+# AI INSIGHTS — Built-in AI (Free, local, no API key) + optional Gemini
 # =============================================================================
 
-def is_ollama_available(base_url: str) -> bool:
-    """Return True if the Ollama server responds to /api/tags."""
-    try:
-        resp = requests.get(f"{base_url}/api/tags", timeout=2)
-        return resp.status_code == 200
-    except Exception:
-        return False
+AI_PROVIDERS = ["Built-in AI (Free)", "Gemini"]
 
 
-def _generate_ai_insights_ollama(prompt: str, base_url: str, model: str) -> str:
-    """Call Ollama's generate endpoint with the given prompt."""
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False
-    }
-    resp = requests.post(f"{base_url}/api/generate", json=payload, timeout=30)
-    resp.raise_for_status()
-    return resp.json().get("response", "")
+def generate_ai_insights(kpi_summary: dict, outliers_count: int, variance: dict,
+                          provider: str = "Built-in AI (Free)", api_key: str = "",
+                          model_name: str = GEMINI_MODEL) -> str:
+    """Generate executive commentary. Uses Gemini only when explicitly selected as
+    the provider AND an API key is configured; otherwise (including on any Gemini
+    error) falls back to the Built-in AI — a deterministic, free, local analysis
+    engine that requires no external API and never fails or costs anything."""
+
+    if provider == "Gemini" and api_key:
+        try:
+            return _generate_ai_insights_gemini(kpi_summary, outliers_count, variance, api_key, model_name)
+        except Exception as e:
+            st.warning(f"Gemini call failed, falling back to Built-in AI ({e}).")
+
+    return _builtin_ai_insights(kpi_summary, outliers_count, variance)
 
 
-def _generate_rule_based_insights(kpi_summary: dict, outliers_count: int, variance: dict) -> str:
-    """Deterministic rule‑based commentary (fallback)."""
+def _builtin_ai_insights(kpi_summary: dict, outliers_count: int, variance: dict) -> str:
+    """Smart Analytics' free, built-in local analysis engine. No API key, no
+    external calls, no cost — deterministic rules over the computed KPIs."""
     lines = []
     vpct = variance.get("variance_pct", np.nan)
     if not np.isnan(vpct):
@@ -661,6 +630,10 @@ def _generate_rule_based_insights(kpi_summary: dict, outliers_count: int, varian
             f"- Actual performance is running **{abs(vpct):.0f}% {direction} budget** "
             f"({fmt_omr(variance['variance_abs'])})."
         )
+    fc_vpct = variance.get("forecast_variance_pct", np.nan)
+    if not np.isnan(fc_vpct):
+        direction = "above" if fc_vpct >= 0 else "below"
+        lines.append(f"- Actuals are tracking **{abs(fc_vpct):.0f}% {direction} the latest forecast**.")
     lr = kpi_summary.get("loss_ratio")
     if lr is not None and not np.isnan(lr):
         risk = "elevated" if lr > 65 else "within a healthy range"
@@ -675,9 +648,12 @@ def _generate_rule_based_insights(kpi_summary: dict, outliers_count: int, varian
             f"branch/agent-level review."
         )
     rec_ratio = kpi_summary.get("collection_ratio")
-    if rec_ratio is not None and not np.isnan(rec_ratio):
-        if rec_ratio < 70:
-            lines.append("- Receivables collection is lagging — recommend prioritizing follow-up on aged debtors.")
+    if rec_ratio is not None and not np.isnan(rec_ratio) and rec_ratio < 70:
+        lines.append("- Receivables collection is lagging — recommend prioritizing follow-up on aged debtors.")
+    profit = kpi_summary.get("profitability")
+    if profit is not None and not np.isnan(profit):
+        note = "a net underwriting profit" if profit >= 0 else "a net underwriting loss"
+        lines.append(f"- The portfolio is currently generating {note} of {fmt_omr(profit)}.")
 
     lines.append(
         "- **Recommended actions:** review flagged exceptions with branch heads, validate reinsurance "
@@ -694,10 +670,9 @@ def _generate_ai_insights_gemini(kpi_summary: dict, outliers_count: int, varianc
 
     Requires: pip install google-generativeai
     Configure the API key via the Admin/Configuration screen or environment variable.
-    Default model: gemini-3.5-flash (override in Admin/Configuration).
+    Default model: gemini-3.7-flash (override in Admin/Configuration).
     """
     import google.generativeai as genai
-    from google.api_core.exceptions import InvalidArgument, PermissionDenied, Unauthenticated
 
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
@@ -711,147 +686,111 @@ KPI summary: {json.dumps(kpi_summary, default=str)}
 Outliers flagged: {outliers_count}
 Variance summary: {json.dumps({k: v for k, v in variance.items() if k not in ('by_group',)}, default=str)}
 """
-    try:
-        response = model.generate_content(prompt)
-        return response.text
-    except (InvalidArgument, PermissionDenied, Unauthenticated) as e:
-        # Reraise with a clean message
-        raise Exception("Gemini API authentication failed. Please check your API key and permissions.") from e
+    response = model.generate_content(prompt)
+    return response.text
 
 
-def generate_ai_insights(kpi_summary: dict, outliers_count: int, variance: dict,
-                          cfg: dict, provider_override: str = None) -> str:
-    """
-    Generate executive commentary. Uses the configured AI provider
-    (Gemini or Ollama) if available; otherwise falls back to rule-based.
-    """
-    provider = provider_override or cfg.get("ai_provider", DEFAULT_AI_PROVIDER)
+# ---- Ask-a-question (Q&A over the current data) -----------------------------
 
-    if provider == "gemini":
-        api_key = cfg.get("gemini_api_key", "")
-        if api_key:
-            try:
-                gemini_text = _generate_ai_insights_gemini(
-                    kpi_summary, outliers_count, variance,
-                    api_key, cfg.get("gemini_model", GEMINI_MODEL)
-                )
-                return f"🧠 AI insights generated using **Gemini** ({cfg.get('gemini_model', GEMINI_MODEL)}):\n\n{gemini_text}"
-            except Exception as e:
-                # Show a generic message, not the raw error
-                st.info("ℹ️ Gemini service unavailable. Falling back to rule‑based insights.")
-                # fall through
-        else:
-            st.info("ℹ️ No Gemini API key configured. Using rule‑based insights.")
-
-    elif provider == "ollama":
-        base_url = cfg.get("ollama_base_url", DEFAULT_OLLAMA_URL)
-        model = cfg.get("ollama_model", DEFAULT_OLLAMA_MODEL)
-        if is_ollama_available(base_url):
-            # Build the same prompt as Gemini uses
-            prompt = f"""You are the AI analyst for an insurance company's executive dashboard ("{APP_NAME}").
-Write a concise (4-6 bullet points) executive commentary in {CURRENCY_CODE} covering:
-what changed, why it changed, key risks, and recommended management actions.
-Round all figures to the nearest whole number.
-
-KPI summary: {json.dumps(kpi_summary, default=str)}
-Outliers flagged: {outliers_count}
-Variance summary: {json.dumps({k: v for k, v in variance.items() if k not in ('by_group',)}, default=str)}
-"""
-            try:
-                ollama_text = _generate_ai_insights_ollama(prompt, base_url, model)
-                return f"🧠 AI insights generated using **Ollama** (model: {model}):\n\n{ollama_text}"
-            except Exception as e:
-                st.warning(f"Ollama call failed: {e}. Falling back to rule‑based.")
-        else:
-            st.warning(f"Ollama server at {base_url} not reachable. Falling back to rule‑based.")
-
-    # Fallback: deterministic rule-based insights
-    return _generate_rule_based_insights(kpi_summary, outliers_count, variance)
+def answer_question(question: str, df: pd.DataFrame, cfg: dict) -> str:
+    """Answer a free-text question about the current (filtered) dataset.
+    Uses Gemini when selected and configured; otherwise the free Built-in AI
+    keyword/aggregation engine, which always works offline."""
+    provider = cfg.get("ai_provider", "Built-in AI (Free)")
+    if provider == "Gemini" and cfg.get("gemini_api_key"):
+        try:
+            return _answer_question_gemini(question, df, cfg["gemini_api_key"], cfg.get("gemini_model", GEMINI_MODEL))
+        except Exception as e:
+            st.warning(f"Gemini call failed, answering with Built-in AI ({e}).")
+    return _answer_question_builtin(question, df)
 
 
-def generate_ai_response_to_question(question: str, df: pd.DataFrame, cfg: dict,
-                                      provider_override: str = None) -> str:
-    """
-    Answer a user's question about the data using the selected AI provider.
-    """
-    # Prepare context from data
+def _answer_question_builtin(question: str, df: pd.DataFrame) -> str:
+    """Free, local Q&A: matches the question against known entities (branch,
+    line of business, product, channel) and KPI keywords, then computes the
+    relevant figure directly from the data — no external API required."""
+    if df.empty:
+        return "No data available in the current filter to answer this question."
+    q = question.lower()
     kpi = calculate_kpis(df)
-    var = variance_analysis(df)
-    outliers = detect_outliers(kpi, method=cfg.get("outlier_method", "Z-Score"),
-                                threshold=cfg.get("outlier_threshold", 3.0))
-    outliers_count = int(outliers["is_outlier"].sum())
 
-    kpi_summary = {
-        "loss_ratio": kpi["loss_ratio"].mean(),
-        "expense_ratio": kpi["expense_ratio"].mean(),
-        "combined_ratio": kpi["combined_ratio"].mean(),
-        "collection_ratio": kpi["collection_ratio"].mean(),
-        "profitability": kpi["profitability"].sum(),
-    }
+    entity_cols = ["branch", "group_of_product", "product", "channel", "sub_product"]
+    matched_col, matched_val = None, None
+    for col in entity_cols:
+        for v in sorted(kpi[col].dropna().unique().tolist(), key=len, reverse=True):
+            if str(v).lower() in q:
+                matched_col, matched_val = col, v
+                break
+        if matched_val:
+            break
+    subset = kpi[kpi[matched_col] == matched_val] if matched_val else kpi
+    scope_txt = f" for **{matched_val}**" if matched_val else " across the current filter"
 
-    # Build a detailed context
-    context = f"""
-Company: {cfg['company_name']}
-Currency: {CURRENCY_CODE} ({CURRENCY_SYMBOL})
-Total GWP: {fmt_omr(kpi['gross_written_premium'].sum())}
-Total Profitability: {fmt_omr(kpi['profitability'].sum())}
-Loss Ratio: {fmt_pct(kpi_summary['loss_ratio'])}
-Combined Ratio: {fmt_pct(kpi_summary['combined_ratio'])}
-Outliers flagged: {outliers_count}
-Budget Variance: {fmt_omr(var['variance_abs'])} ({fmt_pct(var['variance_pct'])})
-Top LOBs by GWP: {kpi.groupby('group_of_product')['gross_written_premium'].sum().sort_values(ascending=False).head(3).to_dict()}
+    metric_map = [
+        ("combined ratio", "combined_ratio", fmt_pct, "mean"),
+        ("loss ratio", "loss_ratio", fmt_pct, "mean"),
+        ("expense ratio", "expense_ratio", fmt_pct, "mean"),
+        ("claims ratio", "claims_ratio", fmt_pct, "mean"),
+        ("collection ratio", "collection_ratio", fmt_pct, "mean"),
+        ("reinsurance", "reinsurance_costs", fmt_omr, "sum"),
+        ("receivable", "receivables", fmt_omr, "sum"),
+        ("outstanding claim", "outstanding_claims", fmt_omr, "sum"),
+        ("claims paid", "claims_paid", fmt_omr, "sum"),
+        ("claims reported", "claims_reported", fmt_omr, "sum"),
+        ("profit", "profitability", fmt_omr, "sum"),
+        ("budget", "budget", fmt_omr, "sum"),
+        ("forecast", "forecast", fmt_omr, "sum"),
+        ("variance", "variance_abs", fmt_omr, "sum"),
+        ("gross written premium", "gross_written_premium", fmt_omr, "sum"),
+        ("gwp", "gross_written_premium", fmt_omr, "sum"),
+        ("premium", "gross_written_premium", fmt_omr, "sum"),
+        ("commission", "commissions", fmt_omr, "sum"),
+        ("brokerage", "brokerage_costs", fmt_omr, "sum"),
+    ]
+    for phrase, col, fmt_fn, agg in metric_map:
+        if phrase in q:
+            val = subset[col].mean() if agg == "mean" else subset[col].sum()
+            return f"{fmt_fn(val)}{scope_txt} ({phrase})."
+
+    if "top" in q or "best" in q or "highest" in q:
+        by_group = kpi.groupby("group_of_product", as_index=False)["gross_written_premium"].sum()
+        if not by_group.empty:
+            top = by_group.sort_values("gross_written_premium", ascending=False).iloc[0]
+            return f"The top-performing Line of Business by GWP is **{top['group_of_product']}** at {fmt_omr(top['gross_written_premium'])}."
+
+    if "worst" in q or "lowest" in q or "underperform" in q:
+        by_group = kpi.groupby("group_of_product", as_index=False)["profitability"].sum()
+        if not by_group.empty:
+            worst = by_group.sort_values("profitability", ascending=True).iloc[0]
+            return f"The lowest-profitability Line of Business is **{worst['group_of_product']}** at {fmt_omr(worst['profitability'])}."
+
+    return (
+        f"Here's a snapshot{scope_txt}: GWP {fmt_omr(subset['gross_written_premium'].sum())}, "
+        f"Loss Ratio {fmt_pct(subset['loss_ratio'].mean())}, Combined Ratio {fmt_pct(subset['combined_ratio'].mean())}, "
+        f"Profitability {fmt_omr(subset['profitability'].sum())}. Try asking about a specific KPI "
+        f"(e.g. loss ratio, receivables, claims paid), branch, or line of business — or enable Gemini "
+        f"in Admin / Configuration for fully open-ended Q&A."
+    )
+
+
+def _answer_question_gemini(question: str, df: pd.DataFrame, api_key: str, model_name: str = GEMINI_MODEL) -> str:
+    import google.generativeai as genai
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name)
+    kpi = calculate_kpis(df)
+    summary = kpi_summary_table(kpi).to_dict(orient="records")
+
+    prompt = f"""You are the AI analyst for an insurance company's executive dashboard ("{APP_NAME}").
+Answer the user's question concisely (2-4 sentences) using ONLY the data summary below.
+Round all figures to the nearest whole number and use {CURRENCY_CODE} for currency values.
+
+Data summary: {json.dumps(summary, default=str)}
+
+Question: {question}
 """
-    prompt = f"""You are an AI assistant for an insurance executive dashboard.
-The user has a question about the data. Use the following context to answer the question.
-If the question is outside the scope of the data, politely say you don't have that information.
-
-Context:
-{context}
-
-User question: {question}
-
-Answer:"""
-
-    provider = provider_override or cfg.get("ai_provider", DEFAULT_AI_PROVIDER)
-
-    if provider == "gemini":
-        api_key = cfg.get("gemini_api_key", "")
-        if api_key:
-            try:
-                import google.generativeai as genai
-                from google.api_core.exceptions import InvalidArgument, PermissionDenied, Unauthenticated
-                genai.configure(api_key=api_key)
-                model = genai.GenerativeModel(cfg.get("gemini_model", GEMINI_MODEL))
-                response = model.generate_content(prompt)
-                return response.text
-            except Exception as e:
-                st.info("ℹ️ Gemini service unavailable. Using rule‑based fallback.")
-                # fall through
-        else:
-            st.info("ℹ️ No Gemini API key. Using rule‑based fallback.")
-
-    elif provider == "ollama":
-        base_url = cfg.get("ollama_base_url", DEFAULT_OLLAMA_URL)
-        model = cfg.get("ollama_model", DEFAULT_OLLAMA_MODEL)
-        if is_ollama_available(base_url):
-            try:
-                return _generate_ai_insights_ollama(prompt, base_url, model)
-            except Exception as e:
-                st.warning(f"Ollama call failed: {e}. Falling back to rule‑based.")
-        else:
-            st.warning(f"Ollama server at {base_url} not reachable. Falling back to rule‑based.")
-
-    # Fallback to a simple rule-based answer
-    if "loss ratio" in question.lower():
-        return f"The current portfolio loss ratio is {fmt_pct(kpi_summary['loss_ratio'])}."
-    elif "profit" in question.lower() or "profitability" in question.lower():
-        return f"Total profitability is {fmt_omr(kpi['profitability'].sum())}."
-    elif "combined ratio" in question.lower():
-        return f"The combined ratio is {fmt_pct(kpi_summary['combined_ratio'])}."
-    elif "budget" in question.lower() or "variance" in question.lower():
-        return f"Budget variance is {fmt_omr(var['variance_abs'])} ({fmt_pct(var['variance_pct'])})."
-    else:
-        return "I'm sorry, I don't have enough information to answer that specific question. Please try asking about KPIs, profitability, loss ratio, combined ratio, or budget variance."
+    response = model.generate_content(prompt)
+    return response.text
 
 
 # =============================================================================
@@ -1038,14 +977,10 @@ def _generate_portfolio_pdf(df: pd.DataFrame, variance: dict, insights_text: str
 
 
 def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) -> bytes:
-    """
-    Rich, fully formatted management report (PDF):
-    - Executive Summary (AI Insights)
-    - KPI Dashboard with definitions
-    - Variance Analysis
-    - Production Forecast (monthly, last 24 months + 12-month forecast)
-    - LOB-wise detailed analysis
-    """
+    """Rich, fully formatted management report (PDF): KPI dashboard with
+    explanations, variance analysis, production forecast (chart + table),
+    and AI executive insights. This is the comprehensive board-level
+    deliverable, distinct from the shorter Portfolio Report."""
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import cm
     from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
@@ -1126,6 +1061,19 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F9FC")]),
     ]))
     story.append(kt)
+    story.append(Spacer(1, 0.25 * cm))
+
+    # Graphical KPI view — key ratios plotted as a bar chart
+    ratio_labels = ["Loss Ratio", "Expense Ratio", "Combined Ratio", "Claims Ratio",
+                     "Collection Ratio", "Profit Margin"]
+    ratio_values = [
+        round(np.nanmean(kpi["loss_ratio"]), 0), round(np.nanmean(kpi["expense_ratio"]), 0),
+        round(np.nanmean(kpi["combined_ratio"]), 0), round(np.nanmean(kpi["claims_ratio"]), 0),
+        round(np.nanmean(kpi["collection_ratio"]), 0), round(np.nanmean(kpi["profit_margin"]), 0),
+    ]
+    kpi_chart_buf = _mpl_bar_chart(ratio_labels, ratio_values, "Key Ratio KPIs (%)", "%")
+    story.append(Image(kpi_chart_buf, width=16 * cm, height=7 * cm))
+    story.append(Spacer(1, 0.25 * cm))
     story.append(Paragraph(f"Outlier exceptions flagged this period: {outliers_count}", body_style))
     story.append(PageBreak())
 
@@ -1178,22 +1126,67 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
     story.append(dt_table)
     story.append(PageBreak())
 
-    # ---- Production Forecast (Monthly, last 24 months + 12-month forecast) ----
-    story.append(Paragraph("Production Forecast (Monthly)", section_style))
+    # ---- Line of Business Detail ----
+    story.append(Paragraph("Line of Business Detail", section_style))
     story.append(HRFlowable(width="100%", color=colors.HexColor("#1f4e79"), thickness=1))
     story.append(Spacer(1, 0.3 * cm))
+    story.append(Paragraph(
+        "Detailed KPI breakdown and monthly GWP trend for every Line of Business in the portfolio.",
+        body_style))
+    story.append(Spacer(1, 0.2 * cm))
 
-    # Filter to last 24 months of historical data
-    if not kpi.empty:
-        kpi['period'] = pd.to_datetime(dict(year=kpi.year, month=kpi.month, day=1))
-        max_date = kpi['period'].max()
-        min_date = max_date - pd.DateOffset(months=23)  # include 24 months
-        kpi_filtered = kpi[kpi['period'] >= min_date].copy()
-        # Use monthly forecast with 12-month horizon
-        fdf = forecast_metrics(kpi_filtered, value_col="gross_written_premium", horizon=12)
-    else:
-        fdf = pd.DataFrame()
+    lob_totals = kpi.groupby("group_of_product", as_index=False)["gross_written_premium"].sum() \
+        .sort_values("gross_written_premium", ascending=False)
+    for lob in lob_totals["group_of_product"]:
+        lob_df = kpi[kpi["group_of_product"] == lob]
+        lob_var_row = by_group[by_group["group_of_product"] == lob]
+        lob_var_abs = lob_var_row["variance_abs"].iloc[0] if not lob_var_row.empty else np.nan
+        lob_var_pct = lob_var_row["variance_pct"].iloc[0] if not lob_var_row.empty else np.nan
 
+        story.append(Paragraph(lob, styles["Heading3"]))
+        lob_kpi_data = [
+            ["GWP", fmt_omr(lob_df["gross_written_premium"].sum()),
+             "Loss Ratio", fmt_pct(np.nanmean(lob_df["loss_ratio"]))],
+            ["Combined Ratio", fmt_pct(np.nanmean(lob_df["combined_ratio"])),
+             "Claims Ratio", fmt_pct(np.nanmean(lob_df["claims_ratio"]))],
+            ["Profitability", fmt_omr(lob_df["profitability"].sum()),
+             "Budget Variance", f"{fmt_omr(lob_var_abs)} ({fmt_pct(lob_var_pct)})"],
+        ]
+        lt = Table(lob_kpi_data, colWidths=[3.5 * cm, 3.5 * cm, 3.5 * cm, 3.5 * cm])
+        lt.setStyle(TableStyle([
+            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+            ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#EDF2F8")),
+            ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#EDF2F8")),
+        ]))
+        story.append(lt)
+
+        # Combined ratio health note (auto-generated, deterministic)
+        cr_mean = np.nanmean(lob_df["combined_ratio"])
+        if not np.isnan(cr_mean):
+            note = ("underwriting profitable" if cr_mean <= 100 else "running an underwriting loss —"
+                    " recommend a rate or cost review")
+            story.append(Paragraph(f"Combined ratio of {fmt_pct(cr_mean)} indicates this line is {note}.",
+                                    ParagraphStyle("lobnote", fontSize=8, textColor=colors.HexColor("#566073"),
+                                                    spaceBefore=4)))
+
+        lob_trend = lob_df.groupby(["year", "month"], as_index=False)["gross_written_premium"].sum() \
+            .sort_values(["year", "month"])
+        if len(lob_trend) >= 2:
+            x_labels = [f"{int(r.year)}-{int(r.month):02d}" for r in lob_trend.itertuples()]
+            lob_chart_buf = _mpl_line_chart(x_labels, {"GWP": lob_trend["gross_written_premium"].round(0).tolist()},
+                                             f"{lob} — Monthly GWP Trend", "OMR")
+            story.append(Image(lob_chart_buf, width=15.5 * cm, height=5.5 * cm))
+        story.append(Spacer(1, 0.35 * cm))
+
+    story.append(PageBreak())
+
+    # ---- Production Forecast ----
+    story.append(Paragraph("Production Forecast", section_style))
+    story.append(HRFlowable(width="100%", color=colors.HexColor("#1f4e79"), thickness=1))
+    story.append(Spacer(1, 0.3 * cm))
+    horizon = cfg.get("forecast_horizon_months", 12)
+    fdf = forecast_metrics(kpi, horizon=horizon)
     if fdf.empty:
         story.append(Paragraph("Not enough historical data to forecast (need at least 4 months).", body_style))
     else:
@@ -1206,7 +1199,7 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
         series["Historical"] = combined_vals
         series["Forecast"] = forecast_vals
         fc_chart_buf = _mpl_line_chart(x_labels, series,
-                                        "Gross Written Premium — 12-Month Forecast (Monthly)", "OMR")
+                                        f"Gross Written Premium — {horizon}-Month Forecast", "OMR")
         story.append(Image(fc_chart_buf, width=16 * cm, height=7 * cm))
         story.append(Spacer(1, 0.2 * cm))
 
@@ -1223,65 +1216,6 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F9FC")]),
         ]))
         story.append(ft)
-
-    story.append(PageBreak())
-
-    # ---- LOB-wise Detailed Analysis ----
-    story.append(Paragraph("Line of Business (LOB) Detailed Analysis", section_style))
-    story.append(HRFlowable(width="100%", color=colors.HexColor("#1f4e79"), thickness=1))
-    story.append(Spacer(1, 0.3 * cm))
-
-    lob_summary = kpi.groupby("group_of_product").agg({
-        "gross_written_premium": "sum",
-        "earned_premium": "sum",
-        "claims_paid": "sum",
-        "profitability": "sum",
-        "loss_ratio": "mean",
-        "combined_ratio": "mean",
-        "expense_ratio": "mean",
-    }).reset_index()
-
-    # Table
-    lob_table_data = [["LOB", "GWP", "Earned Premium", "Claims Paid", "Profitability",
-                       "Loss Ratio", "Expense Ratio", "Combined Ratio"]]
-    for _, r in lob_summary.iterrows():
-        lob_table_data.append([
-            r["group_of_product"],
-            fmt_omr(r["gross_written_premium"]),
-            fmt_omr(r["earned_premium"]),
-            fmt_omr(r["claims_paid"]),
-            fmt_omr(r["profitability"]),
-            fmt_pct(r["loss_ratio"]),
-            fmt_pct(r["expense_ratio"]),
-            fmt_pct(r["combined_ratio"]),
-        ])
-    lt = Table(lob_table_data, colWidths=[4.5*cm, 2.5*cm, 2.5*cm, 2.5*cm, 2.5*cm, 2*cm, 2*cm, 2*cm], repeatRows=1)
-    lt.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTSIZE", (0, 0), (-1, -1), 6.5),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F9FC")]),
-    ]))
-    story.append(lt)
-    story.append(Spacer(1, 0.3 * cm))
-
-    # Bar chart for GWP by LOB
-    gwp_buf = _mpl_bar_chart(
-        lob_summary["group_of_product"].tolist(),
-        lob_summary["gross_written_premium"].round(0).tolist(),
-        "Gross Written Premium by LOB"
-    )
-    story.append(Image(gwp_buf, width=16 * cm, height=6 * cm))
-    story.append(Spacer(1, 0.3 * cm))
-
-    # Profitability by LOB
-    profit_buf = _mpl_bar_chart(
-        lob_summary["group_of_product"].tolist(),
-        lob_summary["profitability"].round(0).tolist(),
-        "Profitability by LOB"
-    )
-    story.append(Image(profit_buf, width=16 * cm, height=6 * cm))
 
     story.append(Spacer(1, 0.5 * cm))
     story.append(Paragraph(
@@ -1445,7 +1379,7 @@ def generate_view_export(role: str, df: pd.DataFrame, cfg: dict, insights_text: 
     raise ValueError(f"Unsupported format: {fmt}")
 
 
-def render_ai_insights_and_export(role: str, df: pd.DataFrame, cfg: dict, provider_override: str = None):
+def render_ai_insights_and_export(role: str, df: pd.DataFrame, cfg: dict):
     """Shared block rendered at the bottom of each CEO/COO/CFO view: AI Insights
     (cached per role) plus PDF/PPTX export of that formatted view."""
     kpi = calculate_kpis(df)
@@ -1461,43 +1395,38 @@ def render_ai_insights_and_export(role: str, df: pd.DataFrame, cfg: dict, provid
         "profitability": kpi["profitability"].sum(),
     }
     cache_key = f"_ai_insights_{role.lower()}"
+    provider = cfg.get("ai_provider", "Built-in AI (Free)")
 
     st.markdown("---")
     header_col, btn_col = st.columns([5, 1])
-    header_col.markdown("### 🤖 AI Insights")
-    # Allow provider override on the fly
-    current_provider = provider_override or cfg.get("ai_provider", DEFAULT_AI_PROVIDER)
-    # Show current provider in a small label
-    if current_provider == "gemini":
-        provider_label = "Gemini" + (" (API)" if cfg.get("gemini_api_key") else " (no key)")
-    elif current_provider == "ollama":
-        provider_label = f"Ollama ({cfg.get('ollama_model', DEFAULT_OLLAMA_MODEL)})"
-    else:
-        provider_label = "Rule‑based (fallback)"
-    st.caption(f"Current AI provider: **{provider_label}**")
-
+    header_col.markdown(f"### 🤖 AI Insights `{provider}`")
     if btn_col.button("🔄 Regenerate", key=f"regen_{role}"):
         st.session_state.pop(cache_key, None)
 
     if cache_key not in st.session_state:
         with st.spinner("Analyzing KPIs, outliers, and variances..."):
             st.session_state[cache_key] = generate_ai_insights(
-                kpi_summary, outliers_count, var, cfg, provider_override
-            )
+                kpi_summary, outliers_count, var,
+                provider=provider,
+                api_key=cfg.get("gemini_api_key", ""),
+                model_name=cfg.get("gemini_model", GEMINI_MODEL))
     st.markdown(st.session_state[cache_key])
 
-    # ---- Q&A Section ----
-    st.markdown("#### ❓ Ask a question about your data")
-    with st.expander("Type your question here (e.g., 'What is the loss ratio trend?')"):
-        question = st.text_input("Your question:", key=f"qa_input_{role}")
-        if st.button("Get AI Answer", key=f"qa_btn_{role}"):
-            if question.strip():
-                with st.spinner("Generating answer..."):
-                    answer = generate_ai_response_to_question(question, df, cfg, provider_override)
-                st.markdown("**Answer:**")
-                st.markdown(answer)
-            else:
-                st.warning("Please enter a question.")
+    st.markdown("##### 💬 Ask a question about this view")
+    qa_key = f"_qa_history_{role.lower()}"
+    st.session_state.setdefault(qa_key, [])
+    with st.form(key=f"qa_form_{role}", clear_on_submit=True):
+        question = st.text_input(
+            "e.g. \"What's the loss ratio for Motor Insurance?\" or \"Which branch has the highest GWP?\"",
+            key=f"qa_input_{role}")
+        asked = st.form_submit_button("Ask")
+    if asked and question.strip():
+        with st.spinner("Thinking..."):
+            answer = answer_question(question.strip(), df, cfg)
+        st.session_state[qa_key].append((question.strip(), answer))
+    for q, a in reversed(st.session_state[qa_key][-5:]):
+        st.markdown(f"**Q: {q}**")
+        st.markdown(f"A: {a}")
 
     st.markdown("##### 📤 Export this view")
     ec1, ec2 = st.columns(2)
@@ -1593,6 +1522,7 @@ def login_screen():
     with col2:
         st.info(
             "**Demo credentials**\n\n"
+            "- `admin` / `admin123` — Admin\n"
             "- `ceo` / `ceo123` — CEO view\n"
             "- `coo` / `coo123` — COO view\n"
             "- `cfo` / `cfo123` — CFO view\n\n"
@@ -1617,7 +1547,7 @@ def sidebar_nav(cfg: dict, hierarchy: pd.DataFrame):
 
     pages = ["Home Dashboard", "Setup", "Data Upload", "CEO View", "COO View", "CFO View",
               "Outlier Detection", "Forecasting", "Budget vs Actual vs Forecast",
-              "AI Insights", "Reports", "Feedback / Recommendations"]
+              "AI Insights", "Reports"]
     if user["role"] == "Admin":
         pages.append("Admin / Configuration")
     page = st.sidebar.radio("Navigate", pages, index=pages.index(st.session_state["page"])
@@ -1933,7 +1863,6 @@ def page_cfo_view(df: pd.DataFrame, cfg: dict):
         fig.update_layout(title="Ratio Trends", yaxis_title="%")
         st.plotly_chart(fig, use_container_width=True)
     with col2:
-        # Use monthly forecast for consistency
         forecast_df = forecast_metrics(kpi, horizon=cfg.get("forecast_horizon_months", 12))
         if not forecast_df.empty:
             fig2 = px.line(forecast_df, x="period", y="value", color="type",
@@ -1996,7 +1925,7 @@ def page_outliers(df: pd.DataFrame, cfg: dict):
 # =============================================================================
 
 def page_forecasting(df: pd.DataFrame, cfg: dict):
-    st.title("🔮 Auto-Forecasting (Monthly)")
+    st.title("🔮 Auto-Forecasting")
     if df.empty:
         st.info("No data available.")
         return
@@ -2112,41 +2041,43 @@ def page_ai_insights(df: pd.DataFrame, cfg: dict):
         "profitability": kpi["profitability"].sum(),
     }
 
-    # Provider override selector
-    provider_override = st.selectbox(
-        "AI Provider (override)",
-        ["default", "gemini", "ollama"],
-        index=0,
-        help="Select 'default' to use the provider configured in Admin."
-    )
-    provider = provider_override if provider_override != "default" else cfg.get("ai_provider", DEFAULT_AI_PROVIDER)
-
+    provider = cfg.get("ai_provider", "Built-in AI (Free)")
     if st.button("🔄 Regenerate Insights", type="primary"):
         st.session_state.pop("_ai_insights_cache", None)
 
     if "_ai_insights_cache" not in st.session_state:
         with st.spinner("Analyzing KPIs, outliers, and variances..."):
             st.session_state["_ai_insights_cache"] = generate_ai_insights(
-                kpi_summary, outliers_count, var, cfg, provider_override if provider_override != "default" else None
-            )
+                kpi_summary, outliers_count, var,
+                provider=provider,
+                api_key=cfg.get("gemini_api_key", ""),
+                model_name=cfg.get("gemini_model", GEMINI_MODEL))
 
     st.markdown(st.session_state["_ai_insights_cache"])
 
-    # Show status of the AI provider
-    if provider == "gemini":
-        if cfg.get("gemini_api_key"):
-            st.caption(f"ℹ️ Powered by Gemini `{cfg.get('gemini_model', GEMINI_MODEL)}`.")
-        else:
-            st.caption("ℹ️ Gemini API key not set. Using rule‑based insights.")
-    elif provider == "ollama":
-        base_url = cfg.get("ollama_base_url", DEFAULT_OLLAMA_URL)
-        model = cfg.get("ollama_model", DEFAULT_OLLAMA_MODEL)
-        if is_ollama_available(base_url):
-            st.caption(f"ℹ️ Powered by Ollama (model: {model}) at {base_url}.")
-        else:
-            st.caption(f"⚠️ Ollama server at {base_url} not reachable. Using rule‑based insights.")
+    if provider == "Gemini" and cfg.get("gemini_api_key"):
+        st.caption(f"ℹ️ Powered by `{cfg.get('gemini_model', GEMINI_MODEL)}`.")
     else:
-        st.caption("ℹ️ Using rule‑based insights.")
+        st.caption(
+            "ℹ️ Powered by the **Built-in AI (Free)** engine — a local, deterministic analysis "
+            "engine that requires no API key. Switch providers in **Admin / Configuration**."
+        )
+
+    st.markdown("---")
+    st.markdown("##### 💬 Ask a question about this data")
+    st.session_state.setdefault("_qa_history_home", [])
+    with st.form(key="qa_form_home", clear_on_submit=True):
+        question = st.text_input(
+            "e.g. \"What's the combined ratio?\" or \"Which line of business is the top performer?\"",
+            key="qa_input_home")
+        asked = st.form_submit_button("Ask")
+    if asked and question.strip():
+        with st.spinner("Thinking..."):
+            answer = answer_question(question.strip(), df, cfg)
+        st.session_state["_qa_history_home"].append((question.strip(), answer))
+    for q, a in reversed(st.session_state["_qa_history_home"][-8:]):
+        st.markdown(f"**Q: {q}**")
+        st.markdown(f"A: {a}")
 
 
 # =============================================================================
@@ -2166,8 +2097,8 @@ def page_reports(df: pd.DataFrame, cfg: dict):
     with tab1:
         st.markdown(
             "A single rich, board-ready PDF covering: Executive Summary (AI Insights), a full "
-            "**KPI Dashboard with definitions**, detailed **Variance Analysis**, **Monthly Production Forecast** "
-            "(last 24 months + 12-month forecast), and a **LOB‑wise detailed analysis**."
+            "**KPI Dashboard with definitions**, detailed **Variance Analysis**, and the "
+            "**Production Forecast** — chart and table."
         )
         if st.button("📘 Generate Full Management Report (PDF)", type="primary"):
             with st.spinner("Building the full management report..."):
@@ -2215,57 +2146,6 @@ def page_reports(df: pd.DataFrame, cfg: dict):
 
 
 # =============================================================================
-# PAGE: FEEDBACK / RECOMMENDATIONS
-# =============================================================================
-
-def page_feedback():
-    st.title("💬 Feedback & Recommendations")
-    st.caption("Share your suggestions or report issues. All feedback is stored locally.")
-
-    # Show form for new feedback
-    with st.form("feedback_form"):
-        category = st.selectbox("Category", ["General", "Feature Request", "Bug Report", "Usability", "Report Issue"])
-        text = st.text_area("Your feedback", height=150)
-        submitted = st.form_submit_button("Submit Feedback")
-        if submitted and text.strip():
-            user = st.session_state["user"]
-            add_feedback(user["username"], text, category)
-            st.success("Thank you for your feedback! We'll review it shortly.")
-            st.balloons()
-        elif submitted and not text.strip():
-            st.error("Please enter some feedback text.")
-
-    st.markdown("---")
-    st.markdown("### Previous Feedback (Admin view only)")
-    user_role = st.session_state["user"]["role"]
-    if user_role == "Admin":
-        feedback = load_feedback()
-        if feedback:
-            df_fb = pd.DataFrame(feedback)
-            # Sort by timestamp descending
-            df_fb = df_fb.sort_values("timestamp", ascending=False)
-            st.dataframe(df_fb, use_container_width=True, hide_index=True)
-
-            # Simple status update (admin only)
-            st.markdown("#### Update status")
-            idx = st.number_input("Index of feedback to update (0-based)", min_value=0, max_value=len(feedback)-1, step=1)
-            new_status = st.selectbox("New status", ["new", "read", "resolved"])
-            if st.button("Update Status"):
-                fb = load_feedback()
-                if 0 <= idx < len(fb):
-                    fb[idx]["status"] = new_status
-                    save_feedback(fb)
-                    st.success("Status updated.")
-                    st.rerun()
-                else:
-                    st.error("Invalid index.")
-        else:
-            st.info("No feedback submitted yet.")
-    else:
-        st.info("As a non-admin user, you can only submit feedback. Admins can view and manage all feedback.")
-
-
-# =============================================================================
 # PAGE: ADMIN / CONFIGURATION
 # =============================================================================
 
@@ -2275,53 +2155,25 @@ def page_admin(cfg: dict, hierarchy: pd.DataFrame):
 
     with tab1:
         with st.form("ai_settings_form"):
-            # AI Provider
             provider = st.selectbox(
-                "AI Provider",
-                ["gemini", "ollama"],
-                index=["gemini", "ollama"].index(cfg.get("ai_provider", DEFAULT_AI_PROVIDER))
-            )
-            if provider == "gemini":
-                api_key = st.text_input("Gemini API Key", value=cfg.get("gemini_api_key", ""), type="password")
-                model_name = st.text_input("Gemini Model", value=cfg.get("gemini_model", GEMINI_MODEL))
-                # Hide Ollama fields
-                ollama_url = cfg.get("ollama_base_url", DEFAULT_OLLAMA_URL)
-                ollama_model = cfg.get("ollama_model", DEFAULT_OLLAMA_MODEL)
-            else:  # ollama
-                ollama_url = st.text_input("Ollama Base URL", value=cfg.get("ollama_base_url", DEFAULT_OLLAMA_URL))
-                ollama_model = st.text_input("Ollama Model", value=cfg.get("ollama_model", DEFAULT_OLLAMA_MODEL))
-                # Hide Gemini fields
-                api_key = cfg.get("gemini_api_key", "")
-                model_name = cfg.get("gemini_model", GEMINI_MODEL)
-
-            # Outlier and forecast settings (common)
+                "AI Provider", AI_PROVIDERS,
+                index=AI_PROVIDERS.index(cfg.get("ai_provider", "Built-in AI (Free)")),
+                help="Built-in AI (Free) runs locally with no API key and no cost. "
+                     "Gemini gives richer, open-ended narrative commentary and Q&A but requires an API key.")
+            st.caption("**Built-in AI (Free)** is a deterministic, local analysis engine — no API key, "
+                       "no external calls, no usage cost. Select **Gemini** below to use a hosted LLM instead.")
+            api_key = st.text_input("Gemini API Key", value=cfg.get("gemini_api_key", ""), type="password")
+            model_name = st.text_input("Gemini Model", value=cfg.get("gemini_model", GEMINI_MODEL))
             method = st.selectbox("Default Outlier Method", ["Z-Score", "IQR", "Isolation Forest"],
                                    index=["Z-Score", "IQR", "Isolation Forest"].index(cfg.get("outlier_method", "Z-Score")))
             threshold = st.slider("Default Z-Score Threshold", 1.5, 5.0, float(cfg.get("outlier_threshold", 3.0)))
             horizon = st.slider("Default Forecast Horizon (months)", 3, 24, cfg.get("forecast_horizon_months", 12))
-
             if st.form_submit_button("Save", type="primary"):
-                cfg.update({
-                    "gemini_api_key": api_key,
-                    "gemini_model": model_name,
-                    "ai_provider": provider,
-                    "ollama_base_url": ollama_url,
-                    "ollama_model": ollama_model,
-                    "outlier_method": method,
-                    "outlier_threshold": threshold,
-                    "forecast_horizon_months": horizon,
-                })
+                cfg.update({"ai_provider": provider, "gemini_api_key": api_key, "gemini_model": model_name,
+                            "outlier_method": method, "outlier_threshold": threshold,
+                            "forecast_horizon_months": horizon})
                 save_config(cfg)
                 st.success("Configuration saved.")
-
-        # Test Ollama connectivity (if provider is ollama)
-        if cfg.get("ai_provider") == "ollama":
-            base_url = cfg.get("ollama_base_url", DEFAULT_OLLAMA_URL)
-            if st.button("Test Ollama Connection"):
-                if is_ollama_available(base_url):
-                    st.success(f"✅ Ollama server at {base_url} is reachable.")
-                else:
-                    st.error(f"❌ Cannot reach Ollama at {base_url}. Make sure it's running and the URL is correct.")
 
     with tab2:
         users = load_users()
@@ -2418,8 +2270,6 @@ def main():
         page_ai_insights(df, cfg)
     elif page == "Reports":
         page_reports(df, cfg)
-    elif page == "Feedback / Recommendations":
-        page_feedback()
     elif page == "Admin / Configuration":
         page_admin(cfg, hierarchy)
 
