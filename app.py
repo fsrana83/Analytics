@@ -197,7 +197,7 @@ def _hash_pw(password: str) -> str:
 def load_users() -> dict:
     default = {
         "admin": {"name": "System Administrator", "role": "Admin",
-                   "password_hash": _hash_pw("admin123"), "email": "admin@smartanalytics.local"},
+                   "password_hash": _hash_pw("admin1234"), "email": "admin@smartanalytics.local"},
         "ceo": {"name": "Chief Executive Officer", "role": "CEO",
                 "password_hash": _hash_pw("ceo123"), "email": "ceo@smartanalytics.local"},
         "coo": {"name": "Chief Operating Officer", "role": "COO",
@@ -1522,7 +1522,6 @@ def login_screen():
     with col2:
         st.info(
             "**Demo credentials**\n\n"
-            "- `admin` / `admin123` — Admin\n"
             "- `ceo` / `ceo123` — CEO view\n"
             "- `coo` / `coo123` — COO view\n"
             "- `cfo` / `cfo123` — CFO view\n\n"
