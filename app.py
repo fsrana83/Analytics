@@ -16,14 +16,14 @@ import json
 import os
 import hashlib
 import datetime as dt
-from typing import Optional
+from typing import Optional, List, Dict
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-import requests  # NEW for Ollama
+import requests  # for Ollama
 
 # =============================================================================
 # CONSTANTS / BRANDING
@@ -41,6 +41,7 @@ HIERARCHY_FILE = os.path.join(DATA_DIR, "hierarchy.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 DATA_FILE = os.path.join(DATA_DIR, "transactions.csv")
+FEEDBACK_FILE = os.path.join(DATA_DIR, "feedback.json")   # NEW
 
 REQUIRED_COLUMNS = [
     "month", "year", "group_of_product", "product", "sub_product",
@@ -180,8 +181,7 @@ def load_config() -> dict:
         "outlier_method": "Z-Score",
         "outlier_threshold": 3.0,
         "forecast_horizon_months": 12,
-        # NEW AI provider settings
-        "ai_provider": DEFAULT_AI_PROVIDER,          # 'gemini' or 'ollama'
+        "ai_provider": DEFAULT_AI_PROVIDER,
         "ollama_base_url": DEFAULT_OLLAMA_URL,
         "ollama_model": DEFAULT_OLLAMA_MODEL,
     }
@@ -193,6 +193,30 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     _save_json(CONFIG_FILE, cfg)
+
+
+# ---- Feedback / Recommendations ---------------------------------------------
+
+def load_feedback() -> List[Dict]:
+    """Load all feedback entries."""
+    default = []
+    return _load_json(FEEDBACK_FILE, default)
+
+
+def save_feedback(feedback: List[Dict]) -> None:
+    _save_json(FEEDBACK_FILE, feedback)
+
+
+def add_feedback(username: str, text: str, category: str = "General") -> None:
+    feedback = load_feedback()
+    feedback.append({
+        "username": username,
+        "timestamp": dt.datetime.now().isoformat(),
+        "category": category,
+        "text": text,
+        "status": "new",   # new, read, resolved
+    })
+    save_feedback(feedback)
 
 
 # ---- Users / auth ------------------------------------------------------------
@@ -510,52 +534,52 @@ def detect_outliers(df: pd.DataFrame, value_col: str = "gross_written_premium",
 
 
 # =============================================================================
-# FORECASTING
+# FORECASTING (with quarterly aggregation)
 # =============================================================================
 
-def forecast_metrics(df: pd.DataFrame, value_col: str = "gross_written_premium",
-                      horizon: int = 12) -> pd.DataFrame:
-    """Project the next `horizon` months using the best available lightweight method.
-
-    Tries statsmodels Holt-Winters exponential smoothing first (captures trend +
-    seasonality); falls back to a simple linear-trend + seasonal-naive blend if
-    statsmodels is unavailable or history is too short.
+def forecast_metrics_quarterly(df: pd.DataFrame, value_col: str = "gross_written_premium",
+                                horizon_quarters: int = 4) -> pd.DataFrame:
     """
-    hist = df.groupby(["year", "month"], as_index=False)[value_col].sum().sort_values(["year", "month"])
-    hist["period"] = pd.to_datetime(dict(year=hist.year, month=hist.month, day=1))
-    hist = hist.set_index("period")[value_col].asfreq("MS").interpolate()
+    Project the next `horizon_quarters` quarters using the best available method.
+    Input data is monthly; we first aggregate to quarters.
+    """
+    # Aggregate to quarters
+    df["quarter"] = (df["month"] - 1) // 3 + 1
+    q = df.groupby(["year", "quarter"], as_index=False)[value_col].sum().sort_values(["year", "quarter"])
+    q["period"] = pd.to_datetime(dict(year=q.year, month=(q.quarter-1)*3 + 1, day=1))
+    q = q.set_index("period")[value_col].asfreq("QS").interpolate()
 
-    if len(hist) < 4:
+    if len(q) < 2:
         return pd.DataFrame(columns=["period", "value", "type", "lower", "upper"])
 
-    future_index = pd.date_range(hist.index[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
+    future_index = pd.date_range(q.index[-1] + pd.offsets.QuarterBegin(1), periods=horizon_quarters, freq="QS")
 
     try:
         from statsmodels.tsa.holtwinters import ExponentialSmoothing
-        seasonal_periods = 12 if len(hist) >= 24 else None
+        seasonal_periods = 4 if len(q) >= 8 else None
         model = ExponentialSmoothing(
-            hist, trend="add",
+            q, trend="add",
             seasonal="add" if seasonal_periods else None,
             seasonal_periods=seasonal_periods,
             initialization_method="estimated",
         ).fit()
-        preds = model.forecast(horizon)
-        resid_std = np.std(model.resid) if hasattr(model, "resid") else hist.std() * 0.1
+        preds = model.forecast(horizon_quarters)
+        resid_std = np.std(model.resid) if hasattr(model, "resid") else q.std() * 0.1
         lower = preds - 1.96 * resid_std
         upper = preds + 1.96 * resid_std
     except Exception:
         # Linear trend fallback
-        x = np.arange(len(hist))
-        coeffs = np.polyfit(x, hist.values, 1)
+        x = np.arange(len(q))
+        coeffs = np.polyfit(x, q.values, 1)
         trend = np.poly1d(coeffs)
-        future_x = np.arange(len(hist), len(hist) + horizon)
+        future_x = np.arange(len(q), len(q) + horizon_quarters)
         preds = pd.Series(trend(future_x), index=future_index)
-        resid_std = np.std(hist.values - trend(x))
+        resid_std = np.std(q.values - trend(x))
         lower = preds - 1.96 * resid_std
         upper = preds + 1.96 * resid_std
 
-    hist_df = pd.DataFrame({"period": hist.index, "value": hist.values, "type": "Historical",
-                             "lower": hist.values, "upper": hist.values})
+    hist_df = pd.DataFrame({"period": q.index, "value": q.values, "type": "Historical",
+                             "lower": q.values, "upper": q.values})
     fc_df = pd.DataFrame({"period": future_index, "value": preds.values, "type": "Forecast",
                            "lower": lower.values, "upper": upper.values})
     return pd.concat([hist_df, fc_df], ignore_index=True)
@@ -603,7 +627,7 @@ def variance_analysis(df: pd.DataFrame) -> dict:
 
 
 # =============================================================================
-# AI INSIGHTS (Gemini / Ollama / Rule-based)
+# AI INSIGHTS (Gemini / Ollama / Rule-based) + Q&A
 # =============================================================================
 
 def is_ollama_available(base_url: str) -> bool:
@@ -673,6 +697,7 @@ def _generate_ai_insights_gemini(kpi_summary: dict, outliers_count: int, varianc
     Default model: gemini-3.5-flash (override in Admin/Configuration).
     """
     import google.generativeai as genai
+    from google.api_core.exceptions import InvalidArgument, PermissionDenied, Unauthenticated
 
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
@@ -686,8 +711,12 @@ KPI summary: {json.dumps(kpi_summary, default=str)}
 Outliers flagged: {outliers_count}
 Variance summary: {json.dumps({k: v for k, v in variance.items() if k not in ('by_group',)}, default=str)}
 """
-    response = model.generate_content(prompt)
-    return response.text
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except (InvalidArgument, PermissionDenied, Unauthenticated) as e:
+        # Reraise with a clean message
+        raise Exception("Gemini API authentication failed. Please check your API key and permissions.") from e
 
 
 def generate_ai_insights(kpi_summary: dict, outliers_count: int, variance: dict,
@@ -708,9 +737,11 @@ def generate_ai_insights(kpi_summary: dict, outliers_count: int, variance: dict,
                 )
                 return f"🧠 AI insights generated using **Gemini** ({cfg.get('gemini_model', GEMINI_MODEL)}):\n\n{gemini_text}"
             except Exception as e:
-                st.warning(f"Gemini call failed: {e}. Falling back to rule‑based.")
+                # Show a generic message, not the raw error
+                st.info("ℹ️ Gemini service unavailable. Falling back to rule‑based insights.")
+                # fall through
         else:
-            st.info("ℹ️ No Gemini API key configured. Falling back to rule‑based insights.")
+            st.info("ℹ️ No Gemini API key configured. Using rule‑based insights.")
 
     elif provider == "ollama":
         base_url = cfg.get("ollama_base_url", DEFAULT_OLLAMA_URL)
@@ -736,6 +767,91 @@ Variance summary: {json.dumps({k: v for k, v in variance.items() if k not in ('b
 
     # Fallback: deterministic rule-based insights
     return _generate_rule_based_insights(kpi_summary, outliers_count, variance)
+
+
+def generate_ai_response_to_question(question: str, df: pd.DataFrame, cfg: dict,
+                                      provider_override: str = None) -> str:
+    """
+    Answer a user's question about the data using the selected AI provider.
+    """
+    # Prepare context from data
+    kpi = calculate_kpis(df)
+    var = variance_analysis(df)
+    outliers = detect_outliers(kpi, method=cfg.get("outlier_method", "Z-Score"),
+                                threshold=cfg.get("outlier_threshold", 3.0))
+    outliers_count = int(outliers["is_outlier"].sum())
+
+    kpi_summary = {
+        "loss_ratio": kpi["loss_ratio"].mean(),
+        "expense_ratio": kpi["expense_ratio"].mean(),
+        "combined_ratio": kpi["combined_ratio"].mean(),
+        "collection_ratio": kpi["collection_ratio"].mean(),
+        "profitability": kpi["profitability"].sum(),
+    }
+
+    # Build a detailed context
+    context = f"""
+Company: {cfg['company_name']}
+Currency: {CURRENCY_CODE} ({CURRENCY_SYMBOL})
+Total GWP: {fmt_omr(kpi['gross_written_premium'].sum())}
+Total Profitability: {fmt_omr(kpi['profitability'].sum())}
+Loss Ratio: {fmt_pct(kpi_summary['loss_ratio'])}
+Combined Ratio: {fmt_pct(kpi_summary['combined_ratio'])}
+Outliers flagged: {outliers_count}
+Budget Variance: {fmt_omr(var['variance_abs'])} ({fmt_pct(var['variance_pct'])})
+Top LOBs by GWP: {kpi.groupby('group_of_product')['gross_written_premium'].sum().sort_values(ascending=False).head(3).to_dict()}
+"""
+    prompt = f"""You are an AI assistant for an insurance executive dashboard.
+The user has a question about the data. Use the following context to answer the question.
+If the question is outside the scope of the data, politely say you don't have that information.
+
+Context:
+{context}
+
+User question: {question}
+
+Answer:"""
+
+    provider = provider_override or cfg.get("ai_provider", DEFAULT_AI_PROVIDER)
+
+    if provider == "gemini":
+        api_key = cfg.get("gemini_api_key", "")
+        if api_key:
+            try:
+                import google.generativeai as genai
+                from google.api_core.exceptions import InvalidArgument, PermissionDenied, Unauthenticated
+                genai.configure(api_key=api_key)
+                model = genai.GenerativeModel(cfg.get("gemini_model", GEMINI_MODEL))
+                response = model.generate_content(prompt)
+                return response.text
+            except Exception as e:
+                st.info("ℹ️ Gemini service unavailable. Using rule‑based fallback.")
+                # fall through
+        else:
+            st.info("ℹ️ No Gemini API key. Using rule‑based fallback.")
+
+    elif provider == "ollama":
+        base_url = cfg.get("ollama_base_url", DEFAULT_OLLAMA_URL)
+        model = cfg.get("ollama_model", DEFAULT_OLLAMA_MODEL)
+        if is_ollama_available(base_url):
+            try:
+                return _generate_ai_insights_ollama(prompt, base_url, model)
+            except Exception as e:
+                st.warning(f"Ollama call failed: {e}. Falling back to rule‑based.")
+        else:
+            st.warning(f"Ollama server at {base_url} not reachable. Falling back to rule‑based.")
+
+    # Fallback to a simple rule-based answer
+    if "loss ratio" in question.lower():
+        return f"The current portfolio loss ratio is {fmt_pct(kpi_summary['loss_ratio'])}."
+    elif "profit" in question.lower() or "profitability" in question.lower():
+        return f"Total profitability is {fmt_omr(kpi['profitability'].sum())}."
+    elif "combined ratio" in question.lower():
+        return f"The combined ratio is {fmt_pct(kpi_summary['combined_ratio'])}."
+    elif "budget" in question.lower() or "variance" in question.lower():
+        return f"Budget variance is {fmt_omr(var['variance_abs'])} ({fmt_pct(var['variance_pct'])})."
+    else:
+        return "I'm sorry, I don't have enough information to answer that specific question. Please try asking about KPIs, profitability, loss ratio, combined ratio, or budget variance."
 
 
 # =============================================================================
@@ -922,10 +1038,14 @@ def _generate_portfolio_pdf(df: pd.DataFrame, variance: dict, insights_text: str
 
 
 def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) -> bytes:
-    """Rich, fully formatted management report (PDF): KPI dashboard with
-    explanations, variance analysis, production forecast (chart + table),
-    and AI executive insights. This is the comprehensive board-level
-    deliverable, distinct from the shorter Portfolio Report."""
+    """
+    Rich, fully formatted management report (PDF):
+    - Executive Summary (AI Insights)
+    - KPI Dashboard with definitions
+    - Variance Analysis
+    - Production Forecast (quarterly)
+    - LOB-wise detailed analysis (NEW)
+    """
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import cm
     from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
@@ -1058,14 +1178,14 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
     story.append(dt_table)
     story.append(PageBreak())
 
-    # ---- Production Forecast ----
-    story.append(Paragraph("Production Forecast", section_style))
+    # ---- Production Forecast (Quarterly) ----
+    story.append(Paragraph("Production Forecast (Quarterly)", section_style))
     story.append(HRFlowable(width="100%", color=colors.HexColor("#1f4e79"), thickness=1))
     story.append(Spacer(1, 0.3 * cm))
-    horizon = cfg.get("forecast_horizon_months", 12)
-    fdf = forecast_metrics(kpi, horizon=horizon)
+    horizon_quarters = max(4, cfg.get("forecast_horizon_months", 12) // 3)
+    fdf = forecast_metrics_quarterly(kpi, horizon_quarters=horizon_quarters)
     if fdf.empty:
-        story.append(Paragraph("Not enough historical data to forecast (need at least 4 months).", body_style))
+        story.append(Paragraph("Not enough historical data to forecast (need at least 2 quarters).", body_style))
     else:
         hist = fdf[fdf["type"] == "Historical"]
         fut = fdf[fdf["type"] == "Forecast"]
@@ -1076,7 +1196,7 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
         series["Historical"] = combined_vals
         series["Forecast"] = forecast_vals
         fc_chart_buf = _mpl_line_chart(x_labels, series,
-                                        f"Gross Written Premium — {horizon}-Month Forecast", "OMR")
+                                        f"Gross Written Premium — {horizon_quarters}-Quarter Forecast", "OMR")
         story.append(Image(fc_chart_buf, width=16 * cm, height=7 * cm))
         story.append(Spacer(1, 0.2 * cm))
 
@@ -1093,6 +1213,65 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F9FC")]),
         ]))
         story.append(ft)
+
+    story.append(PageBreak())
+
+    # ---- LOB-wise Detailed Analysis (NEW) ----
+    story.append(Paragraph("Line of Business (LOB) Detailed Analysis", section_style))
+    story.append(HRFlowable(width="100%", color=colors.HexColor("#1f4e79"), thickness=1))
+    story.append(Spacer(1, 0.3 * cm))
+
+    lob_summary = kpi.groupby("group_of_product").agg({
+        "gross_written_premium": "sum",
+        "earned_premium": "sum",
+        "claims_paid": "sum",
+        "profitability": "sum",
+        "loss_ratio": "mean",
+        "combined_ratio": "mean",
+        "expense_ratio": "mean",
+    }).reset_index()
+
+    # Table
+    lob_table_data = [["LOB", "GWP", "Earned Premium", "Claims Paid", "Profitability",
+                       "Loss Ratio", "Expense Ratio", "Combined Ratio"]]
+    for _, r in lob_summary.iterrows():
+        lob_table_data.append([
+            r["group_of_product"],
+            fmt_omr(r["gross_written_premium"]),
+            fmt_omr(r["earned_premium"]),
+            fmt_omr(r["claims_paid"]),
+            fmt_omr(r["profitability"]),
+            fmt_pct(r["loss_ratio"]),
+            fmt_pct(r["expense_ratio"]),
+            fmt_pct(r["combined_ratio"]),
+        ])
+    lt = Table(lob_table_data, colWidths=[4.5*cm, 2.5*cm, 2.5*cm, 2.5*cm, 2.5*cm, 2*cm, 2*cm, 2*cm], repeatRows=1)
+    lt.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 6.5),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F9FC")]),
+    ]))
+    story.append(lt)
+    story.append(Spacer(1, 0.3 * cm))
+
+    # Bar chart for GWP by LOB
+    gwp_buf = _mpl_bar_chart(
+        lob_summary["group_of_product"].tolist(),
+        lob_summary["gross_written_premium"].round(0).tolist(),
+        "Gross Written Premium by LOB"
+    )
+    story.append(Image(gwp_buf, width=16 * cm, height=6 * cm))
+    story.append(Spacer(1, 0.3 * cm))
+
+    # Profitability by LOB
+    profit_buf = _mpl_bar_chart(
+        lob_summary["group_of_product"].tolist(),
+        lob_summary["profitability"].round(0).tolist(),
+        "Profitability by LOB"
+    )
+    story.append(Image(profit_buf, width=16 * cm, height=6 * cm))
 
     story.append(Spacer(1, 0.5 * cm))
     story.append(Paragraph(
@@ -1298,6 +1477,19 @@ def render_ai_insights_and_export(role: str, df: pd.DataFrame, cfg: dict, provid
             )
     st.markdown(st.session_state[cache_key])
 
+    # ---- Q&A Section ----
+    st.markdown("#### ❓ Ask a question about your data")
+    with st.expander("Type your question here (e.g., 'What is the loss ratio trend?')"):
+        question = st.text_input("Your question:", key=f"qa_input_{role}")
+        if st.button("Get AI Answer", key=f"qa_btn_{role}"):
+            if question.strip():
+                with st.spinner("Generating answer..."):
+                    answer = generate_ai_response_to_question(question, df, cfg, provider_override)
+                st.markdown("**Answer:**")
+                st.markdown(answer)
+            else:
+                st.warning("Please enter a question.")
+
     st.markdown("##### 📤 Export this view")
     ec1, ec2 = st.columns(2)
     with ec1:
@@ -1392,6 +1584,7 @@ def login_screen():
     with col2:
         st.info(
             "**Demo credentials**\n\n"
+            "- `admin` / `admin123` — Admin\n"
             "- `ceo` / `ceo123` — CEO view\n"
             "- `coo` / `coo123` — COO view\n"
             "- `cfo` / `cfo123` — CFO view\n\n"
@@ -1416,7 +1609,7 @@ def sidebar_nav(cfg: dict, hierarchy: pd.DataFrame):
 
     pages = ["Home Dashboard", "Setup", "Data Upload", "CEO View", "COO View", "CFO View",
               "Outlier Detection", "Forecasting", "Budget vs Actual vs Forecast",
-              "AI Insights", "Reports"]
+              "AI Insights", "Reports", "Feedback / Recommendations"]  # NEW
     if user["role"] == "Admin":
         pages.append("Admin / Configuration")
     page = st.sidebar.radio("Navigate", pages, index=pages.index(st.session_state["page"])
@@ -1732,10 +1925,10 @@ def page_cfo_view(df: pd.DataFrame, cfg: dict):
         fig.update_layout(title="Ratio Trends", yaxis_title="%")
         st.plotly_chart(fig, use_container_width=True)
     with col2:
-        forecast_df = forecast_metrics(kpi, horizon=cfg.get("forecast_horizon_months", 12))
+        forecast_df = forecast_metrics_quarterly(kpi, horizon_quarters=max(4, cfg.get("forecast_horizon_months", 12)//3))
         if not forecast_df.empty:
             fig2 = px.line(forecast_df, x="period", y="value", color="type",
-                            title="Forecast Accuracy Outlook")
+                            title="Forecast Accuracy Outlook (Quarterly)")
             st.plotly_chart(fig2, use_container_width=True)
 
     st.markdown("**Variance Analysis**")
@@ -1790,22 +1983,22 @@ def page_outliers(df: pd.DataFrame, cfg: dict):
 
 
 # =============================================================================
-# PAGE: FORECASTING
+# PAGE: FORECASTING (quarterly)
 # =============================================================================
 
 def page_forecasting(df: pd.DataFrame, cfg: dict):
-    st.title("🔮 Auto-Forecasting")
+    st.title("🔮 Auto-Forecasting (Quarterly)")
     if df.empty:
         st.info("No data available.")
         return
 
     metric = st.selectbox("Metric to forecast", ["gross_written_premium", "claims_paid", "earned_premium"])
-    horizon = st.slider("Forecast horizon (months)", 3, 24, cfg.get("forecast_horizon_months", 12))
+    horizon_quarters = st.slider("Forecast horizon (quarters)", 2, 12, max(4, cfg.get("forecast_horizon_months", 12)//3))
 
     kpi = calculate_kpis(df)
-    fdf = forecast_metrics(kpi, value_col=metric, horizon=horizon)
+    fdf = forecast_metrics_quarterly(kpi, value_col=metric, horizon_quarters=horizon_quarters)
     if fdf.empty:
-        st.warning("Not enough historical data to forecast (need at least 4 months).")
+        st.warning("Not enough historical data to forecast (need at least 2 quarters).")
         return
 
     fig = go.Figure()
@@ -1819,7 +2012,7 @@ def page_forecasting(df: pd.DataFrame, cfg: dict):
                               line=dict(width=0), showlegend=False))
     fig.add_trace(go.Scatter(x=fut["period"], y=fut["lower"], name="Confidence Interval",
                               fill="tonexty", line=dict(width=0), fillcolor="rgba(214,39,40,0.15)"))
-    fig.update_layout(title=f"{metric.replace('_', ' ').title()} — Historical vs Forecast")
+    fig.update_layout(title=f"{metric.replace('_', ' ').title()} — Historical vs Forecast (Quarterly)")
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Forecast Table")
@@ -1964,8 +2157,8 @@ def page_reports(df: pd.DataFrame, cfg: dict):
     with tab1:
         st.markdown(
             "A single rich, board-ready PDF covering: Executive Summary (AI Insights), a full "
-            "**KPI Dashboard with definitions**, detailed **Variance Analysis**, and the "
-            "**Production Forecast** — chart and table."
+            "**KPI Dashboard with definitions**, detailed **Variance Analysis**, **Quarterly Production Forecast**, "
+            "and a **LOB‑wise detailed analysis** (NEW)."
         )
         if st.button("📘 Generate Full Management Report (PDF)", type="primary"):
             with st.spinner("Building the full management report..."):
@@ -2010,6 +2203,57 @@ def page_reports(df: pd.DataFrame, cfg: dict):
     col2.download_button("⬇️ Export Raw Data (Excel)", export_excel({"Data": df}),
                           "raw_data.xlsx",
                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+# =============================================================================
+# PAGE: FEEDBACK / RECOMMENDATIONS (NEW)
+# =============================================================================
+
+def page_feedback():
+    st.title("💬 Feedback & Recommendations")
+    st.caption("Share your suggestions or report issues. All feedback is stored locally.")
+
+    # Show form for new feedback
+    with st.form("feedback_form"):
+        category = st.selectbox("Category", ["General", "Feature Request", "Bug Report", "Usability", "Report Issue"])
+        text = st.text_area("Your feedback", height=150)
+        submitted = st.form_submit_button("Submit Feedback")
+        if submitted and text.strip():
+            user = st.session_state["user"]
+            add_feedback(user["username"], text, category)
+            st.success("Thank you for your feedback! We'll review it shortly.")
+            st.balloons()
+        elif submitted and not text.strip():
+            st.error("Please enter some feedback text.")
+
+    st.markdown("---")
+    st.markdown("### Previous Feedback (Admin view only)")
+    user_role = st.session_state["user"]["role"]
+    if user_role == "Admin":
+        feedback = load_feedback()
+        if feedback:
+            df_fb = pd.DataFrame(feedback)
+            # Sort by timestamp descending
+            df_fb = df_fb.sort_values("timestamp", ascending=False)
+            st.dataframe(df_fb, use_container_width=True, hide_index=True)
+
+            # Simple status update (admin only)
+            st.markdown("#### Update status")
+            idx = st.number_input("Index of feedback to update (0-based)", min_value=0, max_value=len(feedback)-1, step=1)
+            new_status = st.selectbox("New status", ["new", "read", "resolved"])
+            if st.button("Update Status"):
+                fb = load_feedback()
+                if 0 <= idx < len(fb):
+                    fb[idx]["status"] = new_status
+                    save_feedback(fb)
+                    st.success("Status updated.")
+                    st.rerun()
+                else:
+                    st.error("Invalid index.")
+        else:
+            st.info("No feedback submitted yet.")
+    else:
+        st.info("As a non-admin user, you can only submit feedback. Admins can view and manage all feedback.")
 
 
 # =============================================================================
@@ -2165,6 +2409,8 @@ def main():
         page_ai_insights(df, cfg)
     elif page == "Reports":
         page_reports(df, cfg)
+    elif page == "Feedback / Recommendations":
+        page_feedback()
     elif page == "Admin / Configuration":
         page_admin(cfg, hierarchy)
 
