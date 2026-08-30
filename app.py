@@ -1,4 +1,3 @@
-```python
 # -*- coding: utf-8 -*-
 """
 Smart Analytics
@@ -2528,4 +2527,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
