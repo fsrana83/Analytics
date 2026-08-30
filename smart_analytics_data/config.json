@@ -1,0 +1,10 @@
+{
+  "company_name": "A Demo Insurance",
+  "currency_label": "OMR (\ufdfc)",
+  "fiscal_year_start_month": 1,
+  "gemini_api_key": "AQ.Ab8RN6JBkUAppxeU4Vzn-5ZiqVF4Ojsx2dbDMxnGHAx-F4FXCA",
+  "gemini_model": "gemini-3.7-flash",
+  "outlier_method": "Z-Score",
+  "outlier_threshold": 3.0,
+  "forecast_horizon_months": 12
+}
