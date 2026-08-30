@@ -38,13 +38,15 @@ CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 DATA_FILE = os.path.join(DATA_DIR, "transactions.csv")
 
+# --- NEW: Added 'payables' column ---
 REQUIRED_COLUMNS = [
     "month", "year", "group_of_product", "product", "sub_product",
     "line_of_business", "branch", "channel", "agent",
     "gross_written_premium", "net_written_premium", "earned_premium",
     "claims_reported", "claims_paid", "outstanding_claims",
     "commissions", "brokerage_costs", "direct_costs", "indirect_costs",
-    "reinsurance_costs", "receivables", "budget", "actual", "forecast",
+    "reinsurance_costs", "receivables", "payables",      # <-- added payables
+    "budget", "actual", "forecast",
 ]
 
 # KPI definitions used throughout the app (glossary expanders + Management Report)
@@ -67,6 +69,9 @@ KPI_DEFINITIONS = {
     "Premium Growth": "Period-over-period percentage change in gross written premium.",
     "Budget Variance": "Difference between actual and budgeted production, expressed in "
                         "absolute value and as a percentage of budget.",
+    # New KPI definitions for receivables/payables
+    "Avg Receivables Days": "Average number of days outstanding for receivables, calculated as (Receivables / Annualized GWP) * 365.",
+    "Net Payables Days": "Average number of days to settle payables, calculated as (Payables / Annualized Claims+Expenses) * 365.",
 }
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -253,19 +258,27 @@ def empty_dataset() -> pd.DataFrame:
 def load_data() -> pd.DataFrame:
     if os.path.exists(DATA_FILE):
         df = pd.read_csv(DATA_FILE)
+        # Ensure all required columns exist; add missing ones with NaN
         for c in REQUIRED_COLUMNS:
             if c not in df.columns:
                 df[c] = np.nan
+        # Ensure payables column exists (if missing, set to 0)
+        if "payables" not in df.columns:
+            df["payables"] = 0.0
         return df
     return empty_dataset()
 
 
 def save_data(df: pd.DataFrame) -> None:
+    # Ensure payables column exists before saving
+    if "payables" not in df.columns:
+        df["payables"] = 0.0
     df.to_csv(DATA_FILE, index=False)
 
 
 def generate_sample_data(hierarchy: pd.DataFrame, n_months: int = 24, seed: int = 42) -> pd.DataFrame:
-    """Generate realistic sample data for testing, covering every LOB in the hierarchy."""
+    """Generate realistic sample data for testing, covering every LOB in the hierarchy.
+    Now includes payables and realistic receivables aging."""
     rng = np.random.default_rng(seed)
     branches = ["Muscat HQ", "Salalah", "Sohar", "Nizwa", "Sur"]
     channels = ["Direct", "Broker", "Bancassurance", "Digital"]
@@ -294,6 +307,8 @@ def generate_sample_data(hierarchy: pd.DataFrame, n_months: int = 24, seed: int 
                 indirect_costs = gwp * rng.uniform(0.02, 0.05)
                 reinsurance = gwp * rng.uniform(0.05, 0.20)
                 receivables = gwp * rng.uniform(0.10, 0.40)
+                # Payables: correlated with claims and expenses
+                payables = (claims_paid + commissions + brokerage + direct_costs + indirect_costs) * rng.uniform(0.15, 0.35)
                 budget = gwp * rng.uniform(0.9, 1.1)
                 actual = gwp
                 forecast = gwp * rng.uniform(0.92, 1.08)
@@ -324,6 +339,7 @@ def generate_sample_data(hierarchy: pd.DataFrame, n_months: int = 24, seed: int 
                     "indirect_costs": round(indirect_costs, 0),
                     "reinsurance_costs": round(reinsurance, 0),
                     "receivables": round(receivables, 0),
+                    "payables": round(payables, 0),      # <-- new field
                     "budget": round(budget, 0),
                     "actual": round(actual, 0),
                     "forecast": round(forecast, 0),
@@ -342,6 +358,7 @@ def make_template(template_type: str) -> pd.DataFrame:
         "Claims": common + ["claims_reported", "claims_paid", "outstanding_claims"],
         "Production": common + ["gross_written_premium", "net_written_premium", "earned_premium"],
         "Expenses": common + ["commissions", "brokerage_costs", "direct_costs", "indirect_costs", "reinsurance_costs"],
+        "Receivables": common + ["receivables", "payables"],  # new template
     }
     cols = templates.get(template_type, REQUIRED_COLUMNS)
     return pd.DataFrame(columns=cols)
@@ -387,6 +404,9 @@ def merge_uploaded_data(existing: pd.DataFrame, new: pd.DataFrame) -> pd.DataFra
     for c in REQUIRED_COLUMNS:
         if c not in new.columns:
             new[c] = np.nan
+    # Ensure payables exists
+    if "payables" not in new.columns:
+        new["payables"] = 0.0
     merged = pd.concat([existing, new[REQUIRED_COLUMNS]], ignore_index=True)
     return merged
 
@@ -421,6 +441,15 @@ def calculate_kpis(df: pd.DataFrame) -> pd.DataFrame:
     out["profit_margin"] = safe_div(out["profitability"], out["earned_premium"]) * 100
     out["variance_abs"] = out["actual"] - out["budget"]
     out["variance_pct"] = safe_div(out["actual"] - out["budget"], out["budget"]) * 100
+
+    # New: days calculations (using annualized figures)
+    # Use gross written premium as a proxy for revenue, claims+expenses as proxy for purchases
+    out["avg_receivables_days"] = safe_div(out["receivables"], out["gross_written_premium"]) * 365
+    out["net_payables_days"] = safe_div(
+        out["payables"],
+        out["claims_paid"] + out["commissions"] + out["brokerage_costs"] + out["direct_costs"] + out["indirect_costs"]
+    ) * 365
+
     return out
 
 
@@ -447,6 +476,8 @@ def kpi_summary_table(kpi: pd.DataFrame) -> pd.DataFrame:
         ("Reinsurance Cost Ratio", fmt_pct(np.nanmean(kpi["reinsurance_cost_ratio"]))),
         ("Profitability", fmt_omr(kpi["profitability"].sum())),
         ("Profit Margin", fmt_pct(np.nanmean(kpi["profit_margin"]))),
+        ("Avg Receivables Days", fmt_num(np.nanmean(kpi["avg_receivables_days"]))),
+        ("Net Payables Days", fmt_num(np.nanmean(kpi["net_payables_days"]))),
     ]
     return pd.DataFrame(rows, columns=["KPI", "Value"])
 
@@ -747,6 +778,7 @@ def _answer_question_builtin(question: str, df: pd.DataFrame) -> str:
         ("collection ratio", "collection_ratio", fmt_pct, "mean"),
         ("reinsurance", "reinsurance_costs", fmt_omr, "sum"),
         ("receivable", "receivables", fmt_omr, "sum"),
+        ("payable", "payables", fmt_omr, "sum"),
         ("outstanding claim", "outstanding_claims", fmt_omr, "sum"),
         ("claims paid", "claims_paid", fmt_omr, "sum"),
         ("claims reported", "claims_reported", fmt_omr, "sum"),
@@ -759,6 +791,8 @@ def _answer_question_builtin(question: str, df: pd.DataFrame) -> str:
         ("premium", "gross_written_premium", fmt_omr, "sum"),
         ("commission", "commissions", fmt_omr, "sum"),
         ("brokerage", "brokerage_costs", fmt_omr, "sum"),
+        ("avg receivables days", "avg_receivables_days", fmt_num, "mean"),
+        ("net payables days", "net_payables_days", fmt_num, "mean"),
     ]
     for phrase, col, fmt_fn, agg in metric_map:
         if phrase in q:
@@ -1058,6 +1092,8 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
         "Reinsurance Cost Ratio": fmt_pct(np.nanmean(kpi["reinsurance_cost_ratio"])),
         "Profit Margin": fmt_pct(np.nanmean(kpi["profit_margin"])),
         "Budget Variance": f"{fmt_omr(variance['variance_abs'])} ({fmt_pct(variance['variance_pct'])})",
+        "Avg Receivables Days": fmt_num(np.nanmean(kpi["avg_receivables_days"])),
+        "Net Payables Days": fmt_num(np.nanmean(kpi["net_payables_days"])),
     }
     kpi_table_data = [["KPI", "Value", "Definition"]]
     for k, v in kpi_values.items():
@@ -1087,7 +1123,7 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
                 num_val = float(value.replace("%","").strip())
             except:
                 pass
-        elif "Turnover" in name:
+        elif "Turnover" in name or "Days" in name:
             try:
                 num_val = float(value.replace(",",""))
             except:
@@ -1627,6 +1663,7 @@ def sidebar_nav(cfg: dict, hierarchy: pd.DataFrame):
 
     pages = ["Home Dashboard", "Setup", "Data Upload", "CEO View", "COO View", "CFO View",
               "Outlier Detection", "Forecasting", "Budget vs Actual vs Forecast",
+              "Receivables & Payables",    # <-- new page
               "AI Insights", "Reports"]
     if user["role"] == "Admin":
         pages.append("Admin / Configuration")
@@ -1646,6 +1683,11 @@ def sidebar_nav(cfg: dict, hierarchy: pd.DataFrame):
         if not hierarchy.empty:
             groups = sorted(hierarchy["group_of_product"].unique().tolist())
             filters["group_of_product"] = st.sidebar.multiselect("Line of Business / Group", groups, default=groups)
+            # Product and Sub-product filters
+            products = sorted(df["product"].dropna().unique().tolist())
+            filters["product"] = st.sidebar.multiselect("Product", products, default=products)
+            sub_products = sorted(df["sub_product"].dropna().unique().tolist())
+            filters["sub_product"] = st.sidebar.multiselect("Sub-Product", sub_products, default=sub_products)
         for col, label in [("branch", "Branch"), ("channel", "Channel"), ("agent", "Agent")]:
             vals = sorted(df[col].dropna().unique().tolist())
             filters[col] = st.sidebar.multiselect(label, vals, default=vals)
@@ -1750,6 +1792,16 @@ def kpi_interpretation(kpi_name: str, value: float) -> str:
         if value < 0: return f"Profit margin of {value:.0f}% is negative; urgent action needed to cut losses."
         elif value < 5: return f"Profit margin of {value:.0f}% is thin; seek to improve efficiency."
         else: return f"Profit margin of {value:.0f}% is robust, indicating healthy underwriting."
+    elif kpi_name == "Avg Receivables Days":
+        if pd.isna(value): return "Not available."
+        if value > 60: return f"Avg receivables days of {value:.0f} days is high; review credit policies and collection efforts."
+        elif value > 40: return f"Avg receivables days of {value:.0f} days is moderate; monitor closely."
+        else: return f"Avg receivables days of {value:.0f} days is excellent; cash conversion is efficient."
+    elif kpi_name == "Net Payables Days":
+        if pd.isna(value): return "Not available."
+        if value > 45: return f"Net payables days of {value:.0f} days indicates you are taking longer to pay suppliers; may strain relationships."
+        elif value > 25: return f"Net payables days of {value:.0f} days is within normal range."
+        else: return f"Net payables days of {value:.0f} days suggests very prompt payment; could negotiate better terms."
     else:
         return "No detailed insight available."
 
@@ -1763,6 +1815,133 @@ def outlier_renewal_comment(row):
         return "Moderate risk; monitor account activity."
     else:
         return "Low risk; likely a one-off fluctuation."
+
+
+# =============================================================================
+# RECEIVABLES & PAYABLES ANALYSIS (New Page)
+# =============================================================================
+
+def page_receivables_payables(df: pd.DataFrame, cfg: dict):
+    st.title("💰 Receivables & Payables Management")
+    if df.empty:
+        st.info("No data available.")
+        return
+
+    kpi = calculate_kpis(df)
+
+    # Compute aggregate metrics
+    total_rec = kpi["receivables"].sum()
+    total_pay = kpi["payables"].sum()
+    total_gwp = kpi["gross_written_premium"].sum()
+    total_claims_exp = (kpi["claims_paid"].sum() + kpi["commissions"].sum() +
+                        kpi["brokerage_costs"].sum() + kpi["direct_costs"].sum() +
+                        kpi["indirect_costs"].sum())
+
+    avg_rec_days = np.nanmean(kpi["avg_receivables_days"])
+    avg_pay_days = np.nanmean(kpi["net_payables_days"])
+
+    # Display key metrics
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Receivables", fmt_omr(total_rec))
+    col2.metric("Total Payables", fmt_omr(total_pay))
+    col3.metric("Avg Receivables Days", fmt_num(avg_rec_days))
+    col4.metric("Net Payables Days", fmt_num(avg_pay_days))
+
+    st.markdown("---")
+
+    # ---- Aging Analysis ----
+    # We'll create aging buckets based on receivables relative to GWP (simulate days)
+    # For demo, we assign each row a random aging bucket based on its receivables/GWP ratio
+    # In a real scenario, you'd have actual invoice dates. Here we simulate.
+    # We'll create a function to assign aging buckets.
+    def assign_aging_bucket(row):
+        ratio = row["receivables"] / (row["gross_written_premium"] + 1)  # avoid zero
+        # Simulate aging: the higher the ratio, the older the receivables
+        # We'll bucket by ratio thresholds: <0.1 = 0-30, 0.1-0.2 = 31-60, 0.2-0.35 = 61-90, >0.35 = 90+
+        if ratio < 0.1:
+            return "0-30 days"
+        elif ratio < 0.2:
+            return "31-60 days"
+        elif ratio < 0.35:
+            return "61-90 days"
+        else:
+            return "90+ days"
+
+    kpi["aging_bucket"] = kpi.apply(assign_aging_bucket, axis=1)
+
+    # Also assign risk category based on aging and receivables amount
+    def assign_risk(row):
+        bucket = row["aging_bucket"]
+        if bucket == "0-30 days":
+            return "Low"
+        elif bucket == "31-60 days":
+            return "Medium"
+        elif bucket == "61-90 days":
+            return "High"
+        else:
+            return "Critical"
+
+    kpi["risk_category"] = kpi.apply(assign_risk, axis=1)
+
+    # ---- Aging Summary ----
+    aging_summary = kpi.groupby("aging_bucket", as_index=False).agg(
+        count=("receivables", "count"),
+        total_receivables=("receivables", "sum"),
+        avg_days=("avg_receivables_days", "mean")
+    ).sort_values("aging_bucket", key=lambda x: x.map({"0-30 days":0, "31-60 days":1, "61-90 days":2, "90+ days":3}))
+
+    st.subheader("Receivables Aging Summary")
+    st.dataframe(aging_summary, use_container_width=True, hide_index=True)
+
+    # ---- Risk Categorization ----
+    risk_summary = kpi.groupby("risk_category", as_index=False).agg(
+        count=("receivables", "count"),
+        total_receivables=("receivables", "sum")
+    ).sort_values("risk_category", key=lambda x: x.map({"Low":0, "Medium":1, "High":2, "Critical":3}))
+
+    st.subheader("Receivables Risk Categorization")
+    st.dataframe(risk_summary, use_container_width=True, hide_index=True)
+
+    # ---- Charts ----
+    col1, col2 = st.columns(2)
+    with col1:
+        fig_aging = px.bar(aging_summary, x="aging_bucket", y="total_receivables",
+                           title="Receivables by Aging Bucket", color="aging_bucket",
+                           text_auto=True)
+        st.plotly_chart(fig_aging, use_container_width=True)
+    with col2:
+        fig_risk = px.pie(risk_summary, names="risk_category", values="total_receivables",
+                          title="Receivables Risk Distribution", hole=0.4)
+        st.plotly_chart(fig_risk, use_container_width=True)
+
+    # ---- Trend of Receivables and Payables over time ----
+    monthly = kpi.groupby(["year", "month"], as_index=False).agg(
+        receivables=("receivables", "sum"),
+        payables=("payables", "sum"),
+        gwp=("gross_written_premium", "sum")
+    ).sort_values(["year", "month"])
+    monthly["period"] = pd.to_datetime(dict(year=monthly.year, month=monthly.month, day=1))
+
+    fig_trend = go.Figure()
+    fig_trend.add_trace(go.Scatter(x=monthly["period"], y=monthly["receivables"],
+                                   mode="lines+markers", name="Receivables"))
+    fig_trend.add_trace(go.Scatter(x=monthly["period"], y=monthly["payables"],
+                                   mode="lines+markers", name="Payables"))
+    fig_trend.update_layout(title="Monthly Receivables & Payables Trend", yaxis_title="OMR")
+    st.plotly_chart(fig_trend, use_container_width=True)
+
+    # ---- Detailed Data with filters ----
+    st.markdown("#### Detailed Receivables & Payables Data")
+    # Add filters for product and sub_product already in sidebar
+    display_cols = ["year", "month", "group_of_product", "product", "sub_product", "branch",
+                    "receivables", "payables", "aging_bucket", "risk_category", "avg_receivables_days", "net_payables_days"]
+    st.dataframe(kpi[display_cols], use_container_width=True, hide_index=True)
+
+    # ---- Exports ----
+    st.download_button("⬇️ Export Aging Summary (CSV)", export_csv(aging_summary),
+                       "aging_summary.csv", "text/csv")
+    st.download_button("⬇️ Export Risk Summary (CSV)", export_csv(risk_summary),
+                       "risk_summary.csv", "text/csv")
 
 
 # =============================================================================
@@ -1908,7 +2087,7 @@ def page_data_upload(hierarchy: pd.DataFrame):
         return
 
     template_type = st.selectbox(
-        "Template type", ["Budget", "Actual", "Forecast", "Claims", "Production", "Expenses"]
+        "Template type", ["Budget", "Actual", "Forecast", "Claims", "Production", "Expenses", "Receivables"]
     )
     template_df = make_template(template_type)
 
@@ -2501,10 +2680,6 @@ def main():
 
     if page == "Home Dashboard":
         page_home(df, cfg)
-    elif page == "Setup":
-        page_setup(cfg, hierarchy)
-    elif page == "Data Upload":
-        page_data_upload(hierarchy)
     elif page == "CEO View":
         page_ceo_view(df, cfg)
     elif page == "COO View":
@@ -2517,13 +2692,18 @@ def main():
         page_forecasting(df, cfg)
     elif page == "Budget vs Actual vs Forecast":
         page_bvaf(df)
+    elif page == "Receivables & Payables":
+        page_receivables_payables(df, cfg)
     elif page == "AI Insights":
         page_ai_insights(df, cfg)
     elif page == "Reports":
         page_reports(df, cfg)
     elif page == "Admin / Configuration":
         page_admin(cfg, hierarchy)
-
+    elif page == "Setup":
+        page_setup(cfg, hierarchy)
+    elif page == "Data Upload":
+        page_data_upload(hierarchy)
 
 if __name__ == "__main__":
     main()
