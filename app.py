@@ -41,7 +41,7 @@ HIERARCHY_FILE = os.path.join(DATA_DIR, "hierarchy.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 DATA_FILE = os.path.join(DATA_DIR, "transactions.csv")
-FEEDBACK_FILE = os.path.join(DATA_DIR, "feedback.json")   # NEW
+FEEDBACK_FILE = os.path.join(DATA_DIR, "feedback.json")
 
 REQUIRED_COLUMNS = [
     "month", "year", "group_of_product", "product", "sub_product",
@@ -534,52 +534,52 @@ def detect_outliers(df: pd.DataFrame, value_col: str = "gross_written_premium",
 
 
 # =============================================================================
-# FORECASTING (with quarterly aggregation)
+# FORECASTING (monthly)
 # =============================================================================
 
-def forecast_metrics_quarterly(df: pd.DataFrame, value_col: str = "gross_written_premium",
-                                horizon_quarters: int = 4) -> pd.DataFrame:
-    """
-    Project the next `horizon_quarters` quarters using the best available method.
-    Input data is monthly; we first aggregate to quarters.
-    """
-    # Aggregate to quarters
-    df["quarter"] = (df["month"] - 1) // 3 + 1
-    q = df.groupby(["year", "quarter"], as_index=False)[value_col].sum().sort_values(["year", "quarter"])
-    q["period"] = pd.to_datetime(dict(year=q.year, month=(q.quarter-1)*3 + 1, day=1))
-    q = q.set_index("period")[value_col].asfreq("QS").interpolate()
+def forecast_metrics(df: pd.DataFrame, value_col: str = "gross_written_premium",
+                      horizon: int = 12) -> pd.DataFrame:
+    """Project the next `horizon` months using the best available lightweight method.
 
-    if len(q) < 2:
+    Tries statsmodels Holt-Winters exponential smoothing first (captures trend +
+    seasonality); falls back to a simple linear-trend + seasonal-naive blend if
+    statsmodels is unavailable or history is too short.
+    """
+    hist = df.groupby(["year", "month"], as_index=False)[value_col].sum().sort_values(["year", "month"])
+    hist["period"] = pd.to_datetime(dict(year=hist.year, month=hist.month, day=1))
+    hist = hist.set_index("period")[value_col].asfreq("MS").interpolate()
+
+    if len(hist) < 4:
         return pd.DataFrame(columns=["period", "value", "type", "lower", "upper"])
 
-    future_index = pd.date_range(q.index[-1] + pd.offsets.QuarterBegin(1), periods=horizon_quarters, freq="QS")
+    future_index = pd.date_range(hist.index[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
 
     try:
         from statsmodels.tsa.holtwinters import ExponentialSmoothing
-        seasonal_periods = 4 if len(q) >= 8 else None
+        seasonal_periods = 12 if len(hist) >= 24 else None
         model = ExponentialSmoothing(
-            q, trend="add",
+            hist, trend="add",
             seasonal="add" if seasonal_periods else None,
             seasonal_periods=seasonal_periods,
             initialization_method="estimated",
         ).fit()
-        preds = model.forecast(horizon_quarters)
-        resid_std = np.std(model.resid) if hasattr(model, "resid") else q.std() * 0.1
+        preds = model.forecast(horizon)
+        resid_std = np.std(model.resid) if hasattr(model, "resid") else hist.std() * 0.1
         lower = preds - 1.96 * resid_std
         upper = preds + 1.96 * resid_std
     except Exception:
         # Linear trend fallback
-        x = np.arange(len(q))
-        coeffs = np.polyfit(x, q.values, 1)
+        x = np.arange(len(hist))
+        coeffs = np.polyfit(x, hist.values, 1)
         trend = np.poly1d(coeffs)
-        future_x = np.arange(len(q), len(q) + horizon_quarters)
+        future_x = np.arange(len(hist), len(hist) + horizon)
         preds = pd.Series(trend(future_x), index=future_index)
-        resid_std = np.std(q.values - trend(x))
+        resid_std = np.std(hist.values - trend(x))
         lower = preds - 1.96 * resid_std
         upper = preds + 1.96 * resid_std
 
-    hist_df = pd.DataFrame({"period": q.index, "value": q.values, "type": "Historical",
-                             "lower": q.values, "upper": q.values})
+    hist_df = pd.DataFrame({"period": hist.index, "value": hist.values, "type": "Historical",
+                             "lower": hist.values, "upper": hist.values})
     fc_df = pd.DataFrame({"period": future_index, "value": preds.values, "type": "Forecast",
                            "lower": lower.values, "upper": upper.values})
     return pd.concat([hist_df, fc_df], ignore_index=True)
@@ -1043,8 +1043,8 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
     - Executive Summary (AI Insights)
     - KPI Dashboard with definitions
     - Variance Analysis
-    - Production Forecast (quarterly)
-    - LOB-wise detailed analysis (NEW)
+    - Production Forecast (monthly, last 24 months + 12-month forecast)
+    - LOB-wise detailed analysis
     """
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import cm
@@ -1178,14 +1178,24 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
     story.append(dt_table)
     story.append(PageBreak())
 
-    # ---- Production Forecast (Quarterly) ----
-    story.append(Paragraph("Production Forecast (Quarterly)", section_style))
+    # ---- Production Forecast (Monthly, last 24 months + 12-month forecast) ----
+    story.append(Paragraph("Production Forecast (Monthly)", section_style))
     story.append(HRFlowable(width="100%", color=colors.HexColor("#1f4e79"), thickness=1))
     story.append(Spacer(1, 0.3 * cm))
-    horizon_quarters = max(4, cfg.get("forecast_horizon_months", 12) // 3)
-    fdf = forecast_metrics_quarterly(kpi, horizon_quarters=horizon_quarters)
+
+    # Filter to last 24 months of historical data
+    if not kpi.empty:
+        kpi['period'] = pd.to_datetime(dict(year=kpi.year, month=kpi.month, day=1))
+        max_date = kpi['period'].max()
+        min_date = max_date - pd.DateOffset(months=23)  # include 24 months
+        kpi_filtered = kpi[kpi['period'] >= min_date].copy()
+        # Use monthly forecast with 12-month horizon
+        fdf = forecast_metrics(kpi_filtered, value_col="gross_written_premium", horizon=12)
+    else:
+        fdf = pd.DataFrame()
+
     if fdf.empty:
-        story.append(Paragraph("Not enough historical data to forecast (need at least 2 quarters).", body_style))
+        story.append(Paragraph("Not enough historical data to forecast (need at least 4 months).", body_style))
     else:
         hist = fdf[fdf["type"] == "Historical"]
         fut = fdf[fdf["type"] == "Forecast"]
@@ -1196,7 +1206,7 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
         series["Historical"] = combined_vals
         series["Forecast"] = forecast_vals
         fc_chart_buf = _mpl_line_chart(x_labels, series,
-                                        f"Gross Written Premium — {horizon_quarters}-Quarter Forecast", "OMR")
+                                        "Gross Written Premium — 12-Month Forecast (Monthly)", "OMR")
         story.append(Image(fc_chart_buf, width=16 * cm, height=7 * cm))
         story.append(Spacer(1, 0.2 * cm))
 
@@ -1216,7 +1226,7 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
 
     story.append(PageBreak())
 
-    # ---- LOB-wise Detailed Analysis (NEW) ----
+    # ---- LOB-wise Detailed Analysis ----
     story.append(Paragraph("Line of Business (LOB) Detailed Analysis", section_style))
     story.append(HRFlowable(width="100%", color=colors.HexColor("#1f4e79"), thickness=1))
     story.append(Spacer(1, 0.3 * cm))
@@ -1456,7 +1466,6 @@ def render_ai_insights_and_export(role: str, df: pd.DataFrame, cfg: dict, provid
     header_col, btn_col = st.columns([5, 1])
     header_col.markdown("### 🤖 AI Insights")
     # Allow provider override on the fly
-    provider_opts = ["default", "gemini", "ollama"]
     current_provider = provider_override or cfg.get("ai_provider", DEFAULT_AI_PROVIDER)
     # Show current provider in a small label
     if current_provider == "gemini":
@@ -1588,7 +1597,6 @@ def login_screen():
             "- `coo` / `coo123` — COO view\n"
             "- `cfo` / `cfo123` — CFO view\n\n"
             "Change these immediately in Admin → User Management before production use."
-            "Got Suggestions, leave your feedback in feedback tab"
         )
 
 
@@ -1609,7 +1617,7 @@ def sidebar_nav(cfg: dict, hierarchy: pd.DataFrame):
 
     pages = ["Home Dashboard", "Setup", "Data Upload", "CEO View", "COO View", "CFO View",
               "Outlier Detection", "Forecasting", "Budget vs Actual vs Forecast",
-              "AI Insights", "Reports", "Feedback / Recommendations"]  # NEW
+              "AI Insights", "Reports", "Feedback / Recommendations"]
     if user["role"] == "Admin":
         pages.append("Admin / Configuration")
     page = st.sidebar.radio("Navigate", pages, index=pages.index(st.session_state["page"])
@@ -1925,10 +1933,11 @@ def page_cfo_view(df: pd.DataFrame, cfg: dict):
         fig.update_layout(title="Ratio Trends", yaxis_title="%")
         st.plotly_chart(fig, use_container_width=True)
     with col2:
-        forecast_df = forecast_metrics_quarterly(kpi, horizon_quarters=max(4, cfg.get("forecast_horizon_months", 12)//3))
+        # Use monthly forecast for consistency
+        forecast_df = forecast_metrics(kpi, horizon=cfg.get("forecast_horizon_months", 12))
         if not forecast_df.empty:
             fig2 = px.line(forecast_df, x="period", y="value", color="type",
-                            title="Forecast Accuracy Outlook (Quarterly)")
+                            title="Forecast Accuracy Outlook")
             st.plotly_chart(fig2, use_container_width=True)
 
     st.markdown("**Variance Analysis**")
@@ -1983,22 +1992,22 @@ def page_outliers(df: pd.DataFrame, cfg: dict):
 
 
 # =============================================================================
-# PAGE: FORECASTING (quarterly)
+# PAGE: FORECASTING
 # =============================================================================
 
 def page_forecasting(df: pd.DataFrame, cfg: dict):
-    st.title("🔮 Auto-Forecasting (Quarterly)")
+    st.title("🔮 Auto-Forecasting (Monthly)")
     if df.empty:
         st.info("No data available.")
         return
 
     metric = st.selectbox("Metric to forecast", ["gross_written_premium", "claims_paid", "earned_premium"])
-    horizon_quarters = st.slider("Forecast horizon (quarters)", 2, 12, max(4, cfg.get("forecast_horizon_months", 12)//3))
+    horizon = st.slider("Forecast horizon (months)", 3, 24, cfg.get("forecast_horizon_months", 12))
 
     kpi = calculate_kpis(df)
-    fdf = forecast_metrics_quarterly(kpi, value_col=metric, horizon_quarters=horizon_quarters)
+    fdf = forecast_metrics(kpi, value_col=metric, horizon=horizon)
     if fdf.empty:
-        st.warning("Not enough historical data to forecast (need at least 2 quarters).")
+        st.warning("Not enough historical data to forecast (need at least 4 months).")
         return
 
     fig = go.Figure()
@@ -2012,7 +2021,7 @@ def page_forecasting(df: pd.DataFrame, cfg: dict):
                               line=dict(width=0), showlegend=False))
     fig.add_trace(go.Scatter(x=fut["period"], y=fut["lower"], name="Confidence Interval",
                               fill="tonexty", line=dict(width=0), fillcolor="rgba(214,39,40,0.15)"))
-    fig.update_layout(title=f"{metric.replace('_', ' ').title()} — Historical vs Forecast (Quarterly)")
+    fig.update_layout(title=f"{metric.replace('_', ' ').title()} — Historical vs Forecast")
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Forecast Table")
@@ -2157,8 +2166,8 @@ def page_reports(df: pd.DataFrame, cfg: dict):
     with tab1:
         st.markdown(
             "A single rich, board-ready PDF covering: Executive Summary (AI Insights), a full "
-            "**KPI Dashboard with definitions**, detailed **Variance Analysis**, **Quarterly Production Forecast**, "
-            "and a **LOB‑wise detailed analysis** (NEW)."
+            "**KPI Dashboard with definitions**, detailed **Variance Analysis**, **Monthly Production Forecast** "
+            "(last 24 months + 12-month forecast), and a **LOB‑wise detailed analysis**."
         )
         if st.button("📘 Generate Full Management Report (PDF)", type="primary"):
             with st.spinner("Building the full management report..."):
@@ -2206,7 +2215,7 @@ def page_reports(df: pd.DataFrame, cfg: dict):
 
 
 # =============================================================================
-# PAGE: FEEDBACK / RECOMMENDATIONS (NEW)
+# PAGE: FEEDBACK / RECOMMENDATIONS
 # =============================================================================
 
 def page_feedback():
