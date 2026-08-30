@@ -1,3 +1,4 @@
+```python
 # -*- coding: utf-8 -*-
 """
 Smart Analytics
@@ -479,6 +480,13 @@ def detect_outliers(df: pd.DataFrame, value_col: str = "gross_written_premium",
             scores = model.score_samples(X)
             work["is_outlier"] = preds == -1
             work["outlier_score"] = -scores
+            # Add renewal risk (new)
+            if not work.empty:
+                max_score = work["outlier_score"].max()
+                work["renewal_risk"] = 0.0
+                if max_score > 0:
+                    work["renewal_risk"] = work["outlier_score"] / max_score  # 0-1 scale
+                    # convert to probability-like: higher score = higher risk
             return work
         except ImportError:
             method = "Z-Score"  # graceful fallback if scikit-learn isn't installed
@@ -499,6 +507,12 @@ def detect_outliers(df: pd.DataFrame, value_col: str = "gross_written_premium",
         work.loc[gdf.index, "is_outlier"] = flags
         work.loc[gdf.index, "outlier_score"] = score
 
+    # Add renewal risk (new)
+    if not work.empty:
+        max_score = work["outlier_score"].max()
+        work["renewal_risk"] = 0.0
+        if max_score > 0:
+            work["renewal_risk"] = work["outlier_score"] / max_score  # 0-1 scale
     return work
 
 
@@ -1063,6 +1077,30 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
     story.append(kt)
     story.append(Spacer(1, 0.25 * cm))
 
+    # --- NEW: KPI Deep Dive (interpretations) ---
+    story.append(Paragraph("KPI Deep Dive – Business Implications", section_style))
+    story.append(HRFlowable(width="100%", color=colors.HexColor("#1f4e79"), thickness=1))
+    for name, value in kpi_values.items():
+        # extract numeric value for interpretation
+        num_val = None
+        if "Ratio" in name or "Margin" in name:
+            try:
+                num_val = float(value.replace("%","").strip())
+            except:
+                pass
+        elif "Turnover" in name:
+            try:
+                num_val = float(value.replace(",",""))
+            except:
+                pass
+        else:
+            # for currency, we can skip numeric interpretation or extract
+            pass
+        if num_val is not None:
+            insight = kpi_interpretation(name, num_val)
+            story.append(Paragraph(f"<b>{name}:</b> {insight}", body_style))
+    story.append(Spacer(1, 0.3 * cm))
+
     # Graphical KPI view — key ratios plotted as a bar chart
     ratio_labels = ["Loss Ratio", "Expense Ratio", "Combined Ratio", "Claims Ratio",
                      "Collection Ratio", "Profit Margin"]
@@ -1181,25 +1219,31 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
 
     story.append(PageBreak())
 
-    # ---- Production Forecast ----
+    # ---- Production Forecast (last 24 months + 12-month forecast) ----
     story.append(Paragraph("Production Forecast", section_style))
     story.append(HRFlowable(width="100%", color=colors.HexColor("#1f4e79"), thickness=1))
     story.append(Spacer(1, 0.3 * cm))
-    horizon = cfg.get("forecast_horizon_months", 12)
+    # Force horizon = 12 for management report
+    horizon = 12
     fdf = forecast_metrics(kpi, horizon=horizon)
     if fdf.empty:
         story.append(Paragraph("Not enough historical data to forecast (need at least 4 months).", body_style))
     else:
+        # Filter historical to last 24 months (if available)
         hist = fdf[fdf["type"] == "Historical"]
+        if len(hist) > 24:
+            hist = hist.iloc[-24:]
         fut = fdf[fdf["type"] == "Forecast"]
-        x_labels = [d.strftime("%b-%y") for d in fdf["period"]]
+        fdf_filtered = pd.concat([hist, fut], ignore_index=True)
+
+        x_labels = [d.strftime("%b-%y") for d in fdf_filtered["period"]]
         series = {}
         combined_vals = list(hist["value"]) + [np.nan] * len(fut)
         forecast_vals = [np.nan] * len(hist) + list(fut["value"])
         series["Historical"] = combined_vals
         series["Forecast"] = forecast_vals
         fc_chart_buf = _mpl_line_chart(x_labels, series,
-                                        f"Gross Written Premium — {horizon}-Month Forecast", "OMR")
+                                        f"Gross Written Premium — {horizon}-Month Forecast (last 24 months)", "OMR")
         story.append(Image(fc_chart_buf, width=16 * cm, height=7 * cm))
         story.append(Spacer(1, 0.2 * cm))
 
@@ -1218,6 +1262,44 @@ def generate_management_report(df: pd.DataFrame, cfg: dict, insights_text: str) 
         story.append(ft)
 
     story.append(Spacer(1, 0.5 * cm))
+
+    # ---- Outlier Impact on Renewals ----
+    story.append(Paragraph("Outlier Impact on Renewals", section_style))
+    story.append(HRFlowable(width="100%", color=colors.HexColor("#1f4e79"), thickness=1))
+    outlier_df = detect_outliers(kpi, method=cfg.get("outlier_method", "Z-Score"),
+                                 threshold=cfg.get("outlier_threshold", 3.0))
+    flagged = outlier_df[outlier_df["is_outlier"]]
+    if flagged.empty:
+        story.append(Paragraph("No outliers detected this period.", body_style))
+    else:
+        story.append(Paragraph(
+            f"Total flagged exceptions: {len(flagged)}. The table below shows each outlier's renewal risk "
+            f"(higher score = higher probability of non‑renewal) and a recommended action.",
+            body_style))
+        out_table_data = [["Branch", "Product", "Metric", "Score", "Renewal Risk", "Recommendation"]]
+        for _, row in flagged.iterrows():
+            risk = row.get("renewal_risk", 0.0)
+            risk_pct = f"{risk*100:.0f}%" if risk > 0 else "N/A"
+            rec = outlier_renewal_comment(row)
+            out_table_data.append([
+                row.get("branch", "N/A"),
+                row.get("product", "N/A"),
+                row.get("gross_written_premium", 0),
+                f"{row['outlier_score']:.2f}",
+                risk_pct,
+                rec
+            ])
+        out_tbl = Table(out_table_data, colWidths=[3*cm, 4*cm, 3.5*cm, 2*cm, 2.5*cm, 4*cm], repeatRows=1)
+        out_tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F9FC")]),
+        ]))
+        story.append(out_tbl)
+    story.append(Spacer(1, 0.5 * cm))
+
     story.append(Paragraph(
         f"Report generated by {APP_NAME} on behalf of {company_name}. All figures in "
         f"{CURRENCY_CODE} ({CURRENCY_SYMBOL}), rounded to the nearest whole number.",
@@ -1586,6 +1668,105 @@ def kpi_glossary_expander():
 
 
 # =============================================================================
+# NEW HELPER FUNCTIONS FOR COMMENTARY, GAUGE, INTERPRETATION, RENEWAL
+# =============================================================================
+
+def generate_chart_commentary(df: pd.DataFrame, chart_type: str, metric: str, title: str) -> str:
+    """Return a short narrative explaining the chart's key takeaways."""
+    if df.empty:
+        return "No data available for commentary."
+    if chart_type == "trend":
+        # assumes df has a datetime 'period' column and metric column
+        sorted_df = df.sort_values("period")
+        latest = sorted_df[metric].iloc[-1]
+        earliest = sorted_df[metric].iloc[0]
+        change = ((latest - earliest) / earliest * 100) if earliest != 0 else 0
+        direction = "increased" if change > 0 else "decreased" if change < 0 else "remained stable"
+        return f"Over the period shown, {metric.replace('_',' ').title()} {direction} by {abs(change):.1f}%, from {fmt_omr(earliest)} to {fmt_omr(latest)}."
+    elif chart_type == "bar_by_group":
+        # find top and bottom performers
+        max_row = df.loc[df[metric].idxmax()]
+        min_row = df.loc[df[metric].idxmin()]
+        return f"The highest {metric.replace('_',' ').title()} is **{max_row.iloc[0]}** ({fmt_omr(max_row[metric])}), while the lowest is **{min_row.iloc[0]}** ({fmt_omr(min_row[metric])})."
+    elif chart_type == "pie_donut":
+        total = df[metric].sum()
+        top = df.nlargest(1, metric).iloc[0]
+        return f"The largest contributor is **{top.iloc[0]}** with {top[metric]/total*100:.1f}% of total {metric.replace('_',' ').title()}."
+    else:
+        return "Chart commentary not available for this type."
+
+
+def plot_gauge(value: float, title: str, min_val: float = 0, max_val: float = 100,
+               threshold_good: float = 60, threshold_bad: float = 80) -> go.Figure:
+    """Create a Plotly gauge indicator."""
+    if pd.isna(value):
+        value = 0
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=value,
+        title={'text': title},
+        gauge={
+            'axis': {'range': [min_val, max_val]},
+            'bar': {'color': "darkblue"},
+            'steps': [
+                {'range': [min_val, threshold_good], 'color': "lightgreen"},
+                {'range': [threshold_good, threshold_bad], 'color': "yellow"},
+                {'range': [threshold_bad, max_val], 'color': "salmon"}
+            ],
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': value
+            }
+        }
+    ))
+    fig.update_layout(height=250)
+    return fig
+
+
+def kpi_interpretation(kpi_name: str, value: float) -> str:
+    """Return a tailored business interpretation for a KPI."""
+    if kpi_name == "Loss Ratio":
+        if pd.isna(value): return "Not available."
+        if value > 70: return f"Loss ratio of {value:.0f}% is elevated; consider tightening underwriting or adjusting pricing."
+        elif value > 50: return f"Loss ratio of {value:.0f}% is within acceptable range; monitor for any upward trend."
+        else: return f"Loss ratio of {value:.0f}% is healthy, indicating strong claims control."
+    elif kpi_name == "Combined Ratio":
+        if pd.isna(value): return "Not available."
+        if value > 100: return f"Combined ratio of {value:.0f}% indicates underwriting loss; immediate cost reduction or rate increase is advised."
+        elif value > 95: return f"Combined ratio of {value:.0f}% is near breakeven; look for efficiency gains."
+        else: return f"Combined ratio of {value:.0f}% shows solid profitability."
+    elif kpi_name == "Expense Ratio":
+        if pd.isna(value): return "Not available."
+        if value > 40: return f"Expense ratio of {value:.0f}% is high; review commission structures and operational costs."
+        elif value > 25: return f"Expense ratio of {value:.0f}% is moderate; continue to optimize."
+        else: return f"Expense ratio of {value:.0f}% is lean and efficient."
+    elif kpi_name == "Collection Ratio":
+        if pd.isna(value): return "Not available."
+        if value < 70: return f"Collection ratio of {value:.0f}% is low; ramp up receivables follow-up."
+        elif value < 85: return f"Collection ratio of {value:.0f}% is acceptable but can be improved."
+        else: return f"Collection ratio of {value:.0f}% is excellent; cash flow is strong."
+    elif kpi_name == "Profit Margin":
+        if pd.isna(value): return "Not available."
+        if value < 0: return f"Profit margin of {value:.0f}% is negative; urgent action needed to cut losses."
+        elif value < 5: return f"Profit margin of {value:.0f}% is thin; seek to improve efficiency."
+        else: return f"Profit margin of {value:.0f}% is robust, indicating healthy underwriting."
+    else:
+        return "No detailed insight available."
+
+
+def outlier_renewal_comment(row):
+    """Return a recommendation based on outlier score and risk."""
+    risk = row.get("renewal_risk", 0.0)
+    if risk > 0.7:
+        return "High risk of non-renewal; investigate promptly."
+    elif risk > 0.4:
+        return "Moderate risk; monitor account activity."
+    else:
+        return "Low risk; likely a one-off fluctuation."
+
+
+# =============================================================================
 # PAGE: HOME DASHBOARD
 # =============================================================================
 
@@ -1615,17 +1796,38 @@ def page_home(df: pd.DataFrame, cfg: dict):
     c5.metric("Budget Variance", fmt_pct(var["variance_pct"]), fmt_omr(var["variance_abs"]))
 
     st.markdown("---")
+    # ---- New gauge and donut ----
+    col1, col2 = st.columns(2)
+    with col1:
+        loss_ratio_val = np.nanmean(kpi["loss_ratio"])
+        st.plotly_chart(plot_gauge(loss_ratio_val, "Loss Ratio (%)"), use_container_width=True)
+    with col2:
+        production_by_lob = kpi.groupby("group_of_product", as_index=False)["gross_written_premium"].sum()
+        fig_donut = px.pie(production_by_lob, names="group_of_product", values="gross_written_premium",
+                           hole=0.4, title="Production Mix by Line of Business")
+        st.plotly_chart(fig_donut, use_container_width=True)
+        # commentary for donut
+        commentary = generate_chart_commentary(production_by_lob, "pie_donut", "gross_written_premium", "")
+        st.caption(commentary)
+
+    st.markdown("---")
     col1, col2 = st.columns(2)
     with col1:
         fig = px.line(growth, x="period", y="gross_written_premium", markers=True,
                        title="Gross Written Premium Trend")
         fig.update_traces(line_color="#1f4e79")
         st.plotly_chart(fig, use_container_width=True)
+        commentary = generate_chart_commentary(growth, "trend", "gross_written_premium", "")
+        st.caption(commentary)
+
     with col2:
         by_group = kpi.groupby("group_of_product", as_index=False)["gross_written_premium"].sum()
         fig2 = px.pie(by_group, names="group_of_product", values="gross_written_premium",
                        title="Premium Mix by Line of Business", hole=0.45)
         st.plotly_chart(fig2, use_container_width=True)
+        # additional commentary for pie
+        commentary2 = generate_chart_commentary(by_group, "pie_donut", "gross_written_premium", "")
+        st.caption(commentary2)
 
     st.markdown("#### Recent Exceptions")
     outliers = detect_outliers(kpi, method=cfg.get("outlier_method", "Z-Score"),
@@ -1634,8 +1836,11 @@ def page_home(df: pd.DataFrame, cfg: dict):
     if flagged.empty:
         st.success("No significant exceptions detected in the current filter.")
     else:
-        st.dataframe(flagged[["year", "month", "branch", "product", "gross_written_premium", "outlier_score"]],
-                     use_container_width=True, hide_index=True)
+        # show renewal risk column
+        display_cols = ["year", "month", "branch", "product", "gross_written_premium", "outlier_score", "renewal_risk"]
+        display_df = flagged[display_cols].copy()
+        display_df["renewal_risk"] = display_df["renewal_risk"].apply(lambda x: f"{x*100:.0f}%" if not pd.isna(x) else "N/A")
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     kpi_glossary_expander()
 
@@ -1775,23 +1980,39 @@ def page_ceo_view(df: pd.DataFrame, cfg: dict):
     growth = period_growth(kpi)
     fig = px.area(growth, x="period", y="gross_written_premium", title="Portfolio Growth Trend")
     st.plotly_chart(fig, use_container_width=True)
+    commentary = generate_chart_commentary(growth, "trend", "gross_written_premium", "")
+    st.caption(commentary)
 
     col1, col2 = st.columns(2)
     with col1:
         by_group = kpi.groupby("group_of_product", as_index=False)["profitability"].sum()
-        st.plotly_chart(px.bar(by_group, x="group_of_product", y="profitability",
-                                title="Profitability by Line of Business", color="profitability",
-                                color_continuous_scale="RdYlGn"), use_container_width=True)
+        fig_bar = px.bar(by_group, x="group_of_product", y="profitability",
+                         title="Profitability by Line of Business", color="profitability",
+                         color_continuous_scale="RdYlGn")
+        st.plotly_chart(fig_bar, use_container_width=True)
+        commentary_bar = generate_chart_commentary(by_group, "bar_by_group", "profitability", "")
+        st.caption(commentary_bar)
+
     with col2:
-        outliers = detect_outliers(kpi, method=cfg.get("outlier_method", "Z-Score"),
-                                    threshold=cfg.get("outlier_threshold", 3.0))
-        top_exceptions = outliers[outliers["is_outlier"]].nlargest(10, "outlier_score")
-        st.markdown("**Top Exceptions**")
-        if top_exceptions.empty:
-            st.success("No major exceptions.")
-        else:
-            st.dataframe(top_exceptions[["branch", "product", "gross_written_premium", "outlier_score"]],
-                         use_container_width=True, hide_index=True)
+        # Donut chart for production mix
+        prod_by_lob = kpi.groupby("group_of_product", as_index=False)["gross_written_premium"].sum()
+        fig_donut = px.pie(prod_by_lob, names="group_of_product", values="gross_written_premium",
+                           hole=0.4, title="Production Mix")
+        st.plotly_chart(fig_donut, use_container_width=True)
+        commentary_donut = generate_chart_commentary(prod_by_lob, "pie_donut", "gross_written_premium", "")
+        st.caption(commentary_donut)
+
+    st.markdown("**Top Exceptions**")
+    outliers = detect_outliers(kpi, method=cfg.get("outlier_method", "Z-Score"),
+                                threshold=cfg.get("outlier_threshold", 3.0))
+    top_exceptions = outliers[outliers["is_outlier"]].nlargest(10, "outlier_score")
+    if top_exceptions.empty:
+        st.success("No major exceptions.")
+    else:
+        display_cols = ["branch", "product", "gross_written_premium", "outlier_score", "renewal_risk"]
+        display_df = top_exceptions[display_cols].copy()
+        display_df["renewal_risk"] = display_df["renewal_risk"].apply(lambda x: f"{x*100:.0f}%" if not pd.isna(x) else "N/A")
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     st.markdown("**Budget vs Actual vs Forecast (by Line of Business)**")
     st.dataframe(var["by_group"], use_container_width=True, hide_index=True)
@@ -1815,22 +2036,32 @@ def page_coo_view(df: pd.DataFrame, cfg: dict):
     col1, col2 = st.columns(2)
     with col1:
         by_branch = kpi.groupby("branch", as_index=False)["gross_written_premium"].sum()
-        st.plotly_chart(px.bar(by_branch, x="branch", y="gross_written_premium",
-                                title="Production by Branch"), use_container_width=True)
+        fig_bar = px.bar(by_branch, x="branch", y="gross_written_premium",
+                         title="Production by Branch")
+        st.plotly_chart(fig_bar, use_container_width=True)
+        commentary = generate_chart_commentary(by_branch, "bar_by_group", "gross_written_premium", "")
+        st.caption(commentary)
+
     with col2:
         by_channel = kpi.groupby("channel", as_index=False)["gross_written_premium"].sum()
-        st.plotly_chart(px.bar(by_channel, x="channel", y="gross_written_premium",
-                                title="Production by Channel", color="channel"),
-                         use_container_width=True)
+        fig_donut = px.pie(by_channel, names="channel", values="gross_written_premium",
+                           hole=0.4, title="Production by Channel")
+        st.plotly_chart(fig_donut, use_container_width=True)
+        commentary_donut = generate_chart_commentary(by_channel, "pie_donut", "gross_written_premium", "")
+        st.caption(commentary_donut)
 
     st.markdown("**Outlier Production (flagged)**")
     outliers = detect_outliers(kpi, group_cols=["branch", "agent"],
                                 method=cfg.get("outlier_method", "Z-Score"),
                                 threshold=cfg.get("outlier_threshold", 3.0))
     flagged = outliers[outliers["is_outlier"]]
-    st.dataframe(flagged[["branch", "agent", "product", "gross_written_premium", "outlier_score"]]
-                 if not flagged.empty else pd.DataFrame(columns=["No exceptions"]),
-                 use_container_width=True, hide_index=True)
+    if not flagged.empty:
+        display_cols = ["branch", "agent", "product", "gross_written_premium", "outlier_score", "renewal_risk"]
+        display_df = flagged[display_cols].copy()
+        display_df["renewal_risk"] = display_df["renewal_risk"].apply(lambda x: f"{x*100:.0f}%" if not pd.isna(x) else "N/A")
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    else:
+        st.success("No production outliers detected.")
 
     render_ai_insights_and_export("COO", df, cfg)
 
@@ -1849,6 +2080,10 @@ def page_cfo_view(df: pd.DataFrame, cfg: dict):
     c3.metric("Receivables", fmt_omr(kpi["receivables"].sum()))
     c4.metric("Collection Ratio", fmt_pct(kpi["collection_ratio"].mean()))
 
+    # Gauge for Loss Ratio
+    loss_ratio_val = np.nanmean(kpi["loss_ratio"])
+    st.plotly_chart(plot_gauge(loss_ratio_val, "Overall Loss Ratio (%)"), use_container_width=True)
+
     col1, col2 = st.columns(2)
     with col1:
         trend = kpi.groupby(["year", "month"], as_index=False).agg(
@@ -1861,12 +2096,18 @@ def page_cfo_view(df: pd.DataFrame, cfg: dict):
             fig.add_trace(go.Scatter(x=trend["period"], y=trend[col_name], mode="lines+markers", name=label))
         fig.update_layout(title="Ratio Trends", yaxis_title="%")
         st.plotly_chart(fig, use_container_width=True)
+        # commentary for trend
+        commentary = generate_chart_commentary(trend, "trend", "loss_ratio", "")  # maybe use combined_ratio as well
+        st.caption(commentary)
+
     with col2:
-        forecast_df = forecast_metrics(kpi, horizon=cfg.get("forecast_horizon_months", 12))
-        if not forecast_df.empty:
-            fig2 = px.line(forecast_df, x="period", y="value", color="type",
-                            title="Forecast Accuracy Outlook")
-            st.plotly_chart(fig2, use_container_width=True)
+        # Donut for receivables distribution by LOB (optional)
+        rec_by_lob = kpi.groupby("group_of_product", as_index=False)["receivables"].sum()
+        fig_donut = px.pie(rec_by_lob, names="group_of_product", values="receivables",
+                           hole=0.4, title="Receivables by LOB")
+        st.plotly_chart(fig_donut, use_container_width=True)
+        commentary_donut = generate_chart_commentary(rec_by_lob, "pie_donut", "receivables", "")
+        st.caption(commentary_donut)
 
     st.markdown("**Variance Analysis**")
     st.metric("Total Variance vs Budget", fmt_omr(var["variance_abs"]), fmt_pct(var["variance_pct"]))
@@ -1908,11 +2149,17 @@ def page_outliers(df: pd.DataFrame, cfg: dict):
                       title=f"Exception Chart — {value_col}")
     st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("#### Flagged Records")
+    st.markdown("#### Flagged Records with Renewal Risk")
     cols_to_show = ["year", "month", "branch", "agent", "channel", "product", "sub_product",
-                     value_col, "outlier_score"]
-    st.dataframe(flagged[cols_to_show] if not flagged.empty else pd.DataFrame(columns=cols_to_show),
-                 use_container_width=True, hide_index=True)
+                     value_col, "outlier_score", "renewal_risk"]
+    if not flagged.empty:
+        display_df = flagged[cols_to_show].copy()
+        display_df["renewal_risk"] = display_df["renewal_risk"].apply(lambda x: f"{x*100:.0f}%" if not pd.isna(x) else "N/A")
+        # Add a commentary column
+        display_df["Recommendation"] = flagged.apply(outlier_renewal_comment, axis=1)
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    else:
+        st.success("No outliers flagged.")
 
     if not flagged.empty:
         st.download_button("⬇️ Export Flagged Records (CSV)", export_csv(flagged[cols_to_show]),
@@ -1938,9 +2185,14 @@ def page_forecasting(df: pd.DataFrame, cfg: dict):
         st.warning("Not enough historical data to forecast (need at least 4 months).")
         return
 
-    fig = go.Figure()
+    # Filter historical to last 24 months
     hist = fdf[fdf["type"] == "Historical"]
+    if len(hist) > 24:
+        hist = hist.iloc[-24:]
     fut = fdf[fdf["type"] == "Forecast"]
+    fdf_filtered = pd.concat([hist, fut], ignore_index=True)
+
+    fig = go.Figure()
     fig.add_trace(go.Scatter(x=hist["period"], y=hist["value"], name="Historical",
                               mode="lines+markers", line=dict(color="#1f4e79")))
     fig.add_trace(go.Scatter(x=fut["period"], y=fut["value"], name="Forecast",
@@ -1949,7 +2201,7 @@ def page_forecasting(df: pd.DataFrame, cfg: dict):
                               line=dict(width=0), showlegend=False))
     fig.add_trace(go.Scatter(x=fut["period"], y=fut["lower"], name="Confidence Interval",
                               fill="tonexty", line=dict(width=0), fillcolor="rgba(214,39,40,0.15)"))
-    fig.update_layout(title=f"{metric.replace('_', ' ').title()} — Historical vs Forecast")
+    fig.update_layout(title=f"{metric.replace('_', ' ').title()} — Historical (last 24 months) vs Forecast")
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Forecast Table")
@@ -1984,6 +2236,7 @@ def page_bvaf(df: pd.DataFrame):
         })
         st.plotly_chart(px.bar(comp, x="Metric", y="Value", color="Metric",
                                 title="Budget vs Actual vs Forecast"), use_container_width=True)
+
     with col2:
         st.markdown("#### Variance Drivers (Waterfall)")
         drivers = var["drivers"]
@@ -2275,3 +2528,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
