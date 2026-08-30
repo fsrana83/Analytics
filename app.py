@@ -1584,11 +1584,11 @@ def login_screen():
     with col2:
         st.info(
             "**Demo credentials**\n\n"
-            "- `admin` / `admin123` — Admin\n"
             "- `ceo` / `ceo123` — CEO view\n"
             "- `coo` / `coo123` — COO view\n"
             "- `cfo` / `cfo123` — CFO view\n\n"
             "Change these immediately in Admin → User Management before production use."
+            "Got Suggestions, leave your feedback in feedback tab"
         )
 
 
