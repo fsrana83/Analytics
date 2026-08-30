@@ -31,7 +31,7 @@ import plotly.graph_objects as go
 APP_NAME = "Smart Analytics"
 CURRENCY_SYMBOL = "﷼"          # Official CBO Rial Omani symbol (see cbo.gov.om/omrsymbol)
 CURRENCY_CODE = "OMR"
-GEMINI_MODEL = "gemini-3.7-flash"
+GEMINI_MODEL = "gemini-3.5-flash"
 DATA_DIR = "smart_analytics_data"
 HIERARCHY_FILE = os.path.join(DATA_DIR, "hierarchy.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
