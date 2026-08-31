@@ -29,7 +29,7 @@ import plotly.graph_objects as go
 # =============================================================================
 
 APP_NAME = "Smart Analytics"
-CURRENCY_SYMBOL = "OMR"          # Changed to official text symbol (Rial Omani)
+CURRENCY_SYMBOL = "RO"          # Changed to official text symbol (Rial Omani)
 CURRENCY_CODE = "OMR"
 GEMINI_MODEL = "gemini-3.7-flash"
 DATA_DIR = "smart_analytics_data"
