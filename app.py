@@ -29,7 +29,7 @@ import plotly.graph_objects as go
 # =============================================================================
 
 APP_NAME = "Smart Analytics"
-CURRENCY_SYMBOL = "RO"          # Changed to official text symbol (Rial Omani)
+CURRENCY_SYMBOL = "OMR"          # Official text symbol for Rial Omani
 CURRENCY_CODE = "OMR"
 GEMINI_MODEL = "gemini-3.7-flash"
 DATA_DIR = "smart_analytics_data"
@@ -2171,20 +2171,8 @@ def page_home(df: pd.DataFrame, cfg: dict):
     c5.metric("Budget Variance", fmt_pct(var["variance_pct"]), fmt_omr(var["variance_abs"]))
 
     st.markdown("---")
-    # ---- New gauge and donut ----
-    col1, col2 = st.columns(2)
-    with col1:
-        loss_ratio_val = np.nanmean(kpi["loss_ratio"])
-        st.plotly_chart(plot_gauge(loss_ratio_val, "Loss Ratio (%)"), use_container_width=True)
-    with col2:
-        production_by_lob = kpi.groupby("group_of_product", as_index=False)["gross_written_premium"].sum()
-        fig_donut = px.pie(production_by_lob, names="group_of_product", values="gross_written_premium",
-                           hole=0.4, title="Production Mix by Line of Business")
-        st.plotly_chart(fig_donut, use_container_width=True)
-        commentary = generate_chart_commentary(production_by_lob, "pie_donut", "gross_written_premium", "")
-        st.caption(commentary)
 
-    st.markdown("---")
+    # ---- Two columns: Trend and Premium Mix (removed gauge and donut) ----
     col1, col2 = st.columns(2)
     with col1:
         fig = px.line(growth, x="period", y="gross_written_premium", markers=True,
