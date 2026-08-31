@@ -29,7 +29,7 @@ import plotly.graph_objects as go
 # =============================================================================
 
 APP_NAME = "Smart Analytics"
-CURRENCY_SYMBOL = "﷼"          # Official CBO Rial Omani symbol (see cbo.gov.om/omrsymbol)
+CURRENCY_SYMBOL = "OMR"          # Changed to official text symbol (Rial Omani)
 CURRENCY_CODE = "OMR"
 GEMINI_MODEL = "gemini-3.7-flash"
 DATA_DIR = "smart_analytics_data"
@@ -1733,10 +1733,6 @@ CUSTOM_CSS = """
         display:inline-block; padding:2px 10px; border-radius:12px;
         background:#1f4e79; color:white; font-size:0.75rem; font-weight:600;
     }
-    .top-filter-bar {
-        background-color: white; padding: 10px 15px; border-radius: 8px;
-        border: 1px solid #e6e9ef; margin-bottom: 20px;
-    }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -1750,7 +1746,7 @@ def init_state():
     st.session_state.setdefault("authenticated", False)
     st.session_state.setdefault("user", None)
     st.session_state.setdefault("page", "Home Dashboard")
-    st.session_state.setdefault("filters", {})  # Global filters
+    st.session_state.setdefault("filters", {})
 
 
 init_state()
@@ -1795,10 +1791,11 @@ def login_screen():
 
 
 # =============================================================================
-# SIDEBAR NAVIGATION
+# SIDEBAR NAVIGATION + FILTERS
 # =============================================================================
 
-def sidebar_nav(cfg: dict):
+def sidebar_nav_and_filters(cfg: dict, hierarchy: pd.DataFrame):
+    """Render navigation and filters in the sidebar."""
     user = st.session_state["user"]
     st.sidebar.markdown(f"### 📊 {APP_NAME}")
     st.sidebar.markdown(f"**{cfg['company_name']}**")
@@ -1809,54 +1806,48 @@ def sidebar_nav(cfg: dict):
         st.rerun()
     st.sidebar.divider()
 
-    pages = ["Home Dashboard", "Setup", "Data Upload", "CEO View", "COO View", "CFO View",
-              "Outlier Detection", "Forecasting", "Budget vs Actual vs Forecast",
-              "Receivables & Payables", "AI Insights", "Reports"]
+    # ---- Navigation (radio) ----
+    base_pages = ["Home Dashboard", "Setup", "Data Upload", "CEO View", "COO View", "CFO View",
+                  "Outlier Detection", "Forecasting", "Budget vs Actual vs Forecast",
+                  "Receivables & Payables", "AI Insights", "Reports"]
     if user["role"] == "Admin":
-        pages.append("Admin / Configuration")
-    page = st.sidebar.radio("Navigate", pages, index=pages.index(st.session_state["page"])
-                             if st.session_state["page"] in pages else 0)
-    st.session_state["page"] = page
-    return page
+        base_pages.append("Admin / Configuration")
 
+    selected_page = st.sidebar.radio(
+        "Navigate",
+        base_pages,
+        index=base_pages.index(st.session_state["page"]) if st.session_state["page"] in base_pages else 0
+    )
+    st.session_state["page"] = selected_page
 
-# =============================================================================
-# TOP FILTERS (Global)
-# =============================================================================
+    st.sidebar.divider()
 
-def render_top_filters(hierarchy: pd.DataFrame):
-    """Render a horizontal bar with filters at the top of the page."""
-    st.markdown('<div class="top-filter-bar">', unsafe_allow_html=True)
-    cols = st.columns([1, 1, 1, 1, 1, 1, 1])
+    # ---- Filters ----
+    st.sidebar.markdown("#### Filters")
     df = load_data()
     filters = {}
 
     if not df.empty:
-        with cols[0]:
-            years = sorted(df["year"].dropna().unique().tolist())
-            filters["year"] = st.multiselect("Year", years, default=st.session_state.filters.get("year", years), key="filter_year")
-        with cols[1]:
-            months = sorted(df["month"].dropna().unique().tolist())
-            filters["month"] = st.multiselect("Month", months, default=st.session_state.filters.get("month", months), key="filter_month")
+        years = sorted(df["year"].dropna().unique().tolist())
+        filters["year"] = st.sidebar.multiselect("Year", years, default=st.session_state.filters.get("year", years))
+        months = sorted(df["month"].dropna().unique().tolist())
+        filters["month"] = st.sidebar.multiselect("Month", months, default=st.session_state.filters.get("month", months))
         if not hierarchy.empty:
-            with cols[2]:
-                groups = sorted(hierarchy["group_of_product"].unique().tolist())
-                filters["group_of_product"] = st.multiselect("LOB", groups, default=st.session_state.filters.get("group_of_product", groups), key="filter_lob")
-            with cols[3]:
-                products = sorted(df["product"].dropna().unique().tolist())
-                filters["product"] = st.multiselect("Product", products, default=st.session_state.filters.get("product", products), key="filter_product")
-            with cols[4]:
-                sub_products = sorted(df["sub_product"].dropna().unique().tolist())
-                filters["sub_product"] = st.multiselect("Sub-Product", sub_products, default=st.session_state.filters.get("sub_product", sub_products), key="filter_sub")
-        with cols[5]:
-            branches = sorted(df["branch"].dropna().unique().tolist())
-            filters["branch"] = st.multiselect("Branch", branches, default=st.session_state.filters.get("branch", branches), key="filter_branch")
-        with cols[6]:
-            channels = sorted(df["channel"].dropna().unique().tolist())
-            filters["channel"] = st.multiselect("Channel", channels, default=st.session_state.filters.get("channel", channels), key="filter_channel")
+            groups = sorted(hierarchy["group_of_product"].unique().tolist())
+            filters["group_of_product"] = st.sidebar.multiselect("Line of Business", groups, default=st.session_state.filters.get("group_of_product", groups))
+            products = sorted(df["product"].dropna().unique().tolist())
+            filters["product"] = st.sidebar.multiselect("Product", products, default=st.session_state.filters.get("product", products))
+            sub_products = sorted(df["sub_product"].dropna().unique().tolist())
+            filters["sub_product"] = st.sidebar.multiselect("Sub-Product", sub_products, default=st.session_state.filters.get("sub_product", sub_products))
+        branches = sorted(df["branch"].dropna().unique().tolist())
+        filters["branch"] = st.sidebar.multiselect("Branch", branches, default=st.session_state.filters.get("branch", branches))
+        channels = sorted(df["channel"].dropna().unique().tolist())
+        filters["channel"] = st.sidebar.multiselect("Channel", channels, default=st.session_state.filters.get("channel", channels))
+        agents = sorted(df["agent"].dropna().unique().tolist())
+        filters["agent"] = st.sidebar.multiselect("Agent", agents, default=st.session_state.filters.get("agent", agents))
+
     st.session_state.filters = filters
-    st.markdown('</div>', unsafe_allow_html=True)
-    return filters
+    return selected_page, filters
 
 
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
@@ -2860,14 +2851,15 @@ def main():
 
     cfg = load_config()
     hierarchy = load_hierarchy()
-    page = sidebar_nav(cfg)
 
-    # Render top filters (global)
-    filters = render_top_filters(hierarchy)
+    # Sidebar: navigation + filters
+    selected_page, filters = sidebar_nav_and_filters(cfg, hierarchy)
 
+    # Load data and apply filters
     raw_df = load_data()
     df = apply_filters(raw_df, filters) if not raw_df.empty else raw_df
 
+    # Role-based access restriction
     role = st.session_state["user"]["role"]
     restricted = {
         "CEO View": {"CEO", "Admin"},
@@ -2875,35 +2867,36 @@ def main():
         "CFO View": {"CFO", "Admin"},
         "Admin / Configuration": {"Admin"},
     }
-    if page in restricted and role not in restricted[page]:
+    if selected_page in restricted and role not in restricted[selected_page]:
         st.error(f"Your role ({role}) does not have access to this view.")
         return
 
-    if page == "Home Dashboard":
+    # Route to page
+    if selected_page == "Home Dashboard":
         page_home(df, cfg)
-    elif page == "Setup":
+    elif selected_page == "Setup":
         page_setup(cfg, hierarchy)
-    elif page == "Data Upload":
+    elif selected_page == "Data Upload":
         page_data_upload(hierarchy)
-    elif page == "CEO View":
+    elif selected_page == "CEO View":
         page_ceo_view(df, cfg)
-    elif page == "COO View":
+    elif selected_page == "COO View":
         page_coo_view(df, cfg)
-    elif page == "CFO View":
+    elif selected_page == "CFO View":
         page_cfo_view(df, cfg)
-    elif page == "Outlier Detection":
+    elif selected_page == "Outlier Detection":
         page_outliers(df, cfg)
-    elif page == "Forecasting":
+    elif selected_page == "Forecasting":
         page_forecasting(df, cfg)
-    elif page == "Budget vs Actual vs Forecast":
+    elif selected_page == "Budget vs Actual vs Forecast":
         page_bvaf(df)
-    elif page == "Receivables & Payables":
+    elif selected_page == "Receivables & Payables":
         page_receivables_payables(df, cfg)
-    elif page == "AI Insights":
+    elif selected_page == "AI Insights":
         page_ai_insights(df, cfg)
-    elif page == "Reports":
+    elif selected_page == "Reports":
         page_reports(df, cfg)
-    elif page == "Admin / Configuration":
+    elif selected_page == "Admin / Configuration":
         page_admin(cfg, hierarchy)
 
 
